@@ -387,14 +387,8 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	resolveEnvInConfig(cfg)
+	applyConfigDefaults(cfg)
 
-	if cfg.DataDir == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			cfg.DataDir = filepath.Join(home, ".cc-connect")
-		} else {
-			cfg.DataDir = ".cc-connect"
-		}
-	}
 	cfg.AttachmentSend = strings.ToLower(strings.TrimSpace(cfg.AttachmentSend))
 	if cfg.AttachmentSend == "" {
 		cfg.AttachmentSend = "on"
@@ -409,6 +403,29 @@ func Load(path string) (*Config, error) {
 }
 
 var envPlaceholderPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+func applyConfigDefaults(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	if cfg.DataDir == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			cfg.DataDir = filepath.Join(home, ".cc-connect")
+		} else {
+			cfg.DataDir = ".cc-connect"
+		}
+	}
+	if strings.TrimSpace(cfg.Management.DefaultProjectBasePath) == "" {
+		cfg.Management.DefaultProjectBasePath = defaultProjectBasePath()
+	}
+}
+
+func defaultProjectBasePath() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, "openhousepro", "workspace")
+	}
+	return filepath.Join(".", "openhousepro", "workspace")
+}
 
 func resolveEnvInConfig(cfg *Config) {
 	resolveEnvValue(reflect.ValueOf(cfg))
@@ -2637,6 +2654,7 @@ func AddWebProject(projectName, displayName, workDir, agentType string) (string,
 	if err := toml.Unmarshal(data, cfg); err != nil {
 		return "", fmt.Errorf("parse config: %w", err)
 	}
+	applyConfigDefaults(cfg)
 	projectName = strings.TrimSpace(projectName)
 	displayName = strings.TrimSpace(displayName)
 	if projectName == "" {

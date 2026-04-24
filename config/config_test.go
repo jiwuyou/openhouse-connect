@@ -307,6 +307,26 @@ func TestLoad_DefaultsDataDir(t *testing.T) {
 	}
 }
 
+func TestLoad_DefaultsProjectBasePath(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte(baseConfigTOML), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	want := filepath.Join(dir, "openhousepro", "workspace")
+	if cfg.Management.DefaultProjectBasePath != want {
+		t.Fatalf("Load() management.default_project_base_path = %q, want %q", cfg.Management.DefaultProjectBasePath, want)
+	}
+}
+
 func TestLoad_ResolvesEnvPlaceholders(t *testing.T) {
 
 	root := t.TempDir()
@@ -699,15 +719,33 @@ func TestAddWebProject_GeneratesDifferentNamesForSameDisplayName(t *testing.T) {
 	}
 }
 
-func TestAddWebProject_RequiresWorkDirWhenDefaultBasePathMissing(t *testing.T) {
+func TestAddWebProject_UsesDefaultProjectBasePathWhenUnset(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
 	configPath := writeConfigFixture(t, `
 	[bridge]
 	enabled = true
 	`)
 	patchConfigPath(t, configPath)
 
-	_, err := AddWebProject("", "mobile", "", "")
-	assertErrContains(t, err, "work_dir is required when management.default_project_base_path is not configured")
+	createdName, err := AddWebProject("", "mobile", "", "")
+	if err != nil {
+		t.Fatalf("AddWebProject() error: %v", err)
+	}
+	wantWorkDir := filepath.Join(homeDir, "openhousepro", "workspace", createdName)
+
+	cfg := readConfigFixture(t, configPath)
+	if len(cfg.Projects) != 1 {
+		t.Fatalf("len(cfg.Projects) = %d, want 1", len(cfg.Projects))
+	}
+	if got := stringMapValue(cfg.Projects[0].Agent.Options, "work_dir"); got != wantWorkDir {
+		t.Fatalf("work_dir = %q, want %q", got, wantWorkDir)
+	}
+	if info, err := os.Stat(wantWorkDir); err != nil {
+		t.Fatalf("expected default work dir to be created: %v", err)
+	} else if !info.IsDir() {
+		t.Fatalf("default work dir %q is not a directory", wantWorkDir)
+	}
 }
 
 func TestAddWebProject_RejectsRelativeDefaultBasePath(t *testing.T) {
