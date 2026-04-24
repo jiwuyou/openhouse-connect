@@ -814,6 +814,44 @@ cc-connect daemon logs [-f]
 cc-connect daemon uninstall
 ```
 
+Notes:
+- `cc-connect daemon ...` uses the native service manager (`systemd` on Linux, `launchd` on macOS).
+- In containers, Termux, or other environments without an active service manager, `daemon start` may fail with errors such as `systemd is not active (state: offline)`.
+- In those environments, start cc-connect under a real long-lived parent process such as `tmux`, `screen`, or `nohup`. Do not rely on a short-lived shell wrapper that exits immediately after spawning the process.
+
+Recommended fallback with `tmux`:
+
+```bash
+tmux new -s cc-connect
+cd /path/to/cc-connect
+./cc-connect
+# Press Ctrl+B, then D to detach
+```
+
+Frontend dev server in a separate session:
+
+```bash
+tmux new -s cc-connect-web
+cd /path/to/cc-connect/web
+npm run dev -- --host 127.0.0.1
+# Press Ctrl+B, then D to detach
+```
+
+Minimal fallback with `nohup`:
+
+```bash
+nohup ./cc-connect > /tmp/cc-connect.log 2>&1 &
+nohup npm run dev -- --host 127.0.0.1 > /tmp/cc-connect-web.log 2>&1 &
+```
+
+Verify the service is still alive before debugging UI issues:
+
+```bash
+curl -i http://127.0.0.1:9820/api/v1/status -H 'Authorization: Bearer <management-token>'
+```
+
+If this request fails or returns no body, fix the backend process lifecycle first.
+
 ---
 
 ## Multi-Workspace Mode
@@ -883,9 +921,22 @@ enabled = true
 port = 9820                     # Management UI & API listen port
 token = "your-secret-token"     # Login token; /web setup generates one automatically
 cors_origins = ["*"]            # Allowed CORS origins; empty = no CORS headers
+default_project_base_path = "/abs/path/to/projects"  # optional: base dir for auto-created Web Only projects
 ```
 
 Then restart cc-connect.
+
+If you use the Web Admin to create a `Web Only` project and leave `work_dir` empty, you must configure `management.default_project_base_path` to an absolute path first. Otherwise project creation fails with:
+
+```text
+save config: work_dir is required when management.default_project_base_path is not configured
+```
+
+With `default_project_base_path` configured, cc-connect automatically creates the new project's working directory under:
+
+```text
+<default_project_base_path>/<project-name>
+```
 
 ### Build Options
 
@@ -904,6 +955,23 @@ When built with `no_web`, the `/web` command will report that web admin is not a
 The Management API is served on the same port as the UI. Base URL: `http://<host>:<port>/api/v1`
 
 All API requests require the `Authorization: Bearer <token>` header.
+
+### Troubleshooting
+
+If the web UI shows errors such as:
+
+```text
+Failed to execute 'json' on 'Response': Unexpected end of JSON input
+```
+
+do not assume the API format changed. In practice this usually means the frontend attempted `res.json()` on an empty response because the backend was down, restarting, or got terminated by its parent shell.
+
+Check these first:
+- Confirm `GET /api/v1/status` returns HTTP 200 with a JSON body.
+- Check the backend log for immediate shutdown messages such as `shutting down...` right after startup.
+- If you are running from a transient shell in a container or remote tool session, move the backend to `tmux`, `screen`, or another real supervisor.
+
+Another misleading symptom is the login page reporting `invalid or expired token` when the Management API is actually unreachable. If the frontend dev server is still up but proxy requests to port `9820` fail, fix backend availability first and then retry login.
 
 Key endpoints:
 
