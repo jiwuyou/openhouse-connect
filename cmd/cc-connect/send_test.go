@@ -56,6 +56,8 @@ func TestParseSendArgs_RequiresMessageOrAttachment(t *testing.T) {
 func TestParseSendArgs_UsesSessionEnvFallback(t *testing.T) {
 	t.Setenv("CC_PROJECT", "demo")
 	t.Setenv("CC_SESSION_KEY", "telegram:123:456")
+	t.Setenv("CC_SESSION_ID", "s1")
+	t.Setenv("CC_CONNECT_DATA_DIR", "/tmp/cc-connect-env")
 
 	dir := t.TempDir()
 	imgPath := filepath.Join(dir, "chart.png")
@@ -63,7 +65,7 @@ func TestParseSendArgs_UsesSessionEnvFallback(t *testing.T) {
 		t.Fatalf("write image: %v", err)
 	}
 
-	req, _, err := parseSendArgs([]string{"--image", imgPath})
+	req, dataDir, err := parseSendArgs([]string{"--image", imgPath})
 	if err != nil {
 		t.Fatalf("parseSendArgs returned error: %v", err)
 	}
@@ -72,6 +74,42 @@ func TestParseSendArgs_UsesSessionEnvFallback(t *testing.T) {
 	}
 	if req.SessionKey != "telegram:123:456" {
 		t.Fatalf("session = %q, want telegram:123:456", req.SessionKey)
+	}
+	if req.SessionID != "s1" {
+		t.Fatalf("sessionID = %q, want s1", req.SessionID)
+	}
+	if dataDir != "/tmp/cc-connect-env" {
+		t.Fatalf("dataDir = %q, want /tmp/cc-connect-env", dataDir)
+	}
+}
+
+func TestParseSendArgs_ExplicitSessionIgnoresSessionIDEnv(t *testing.T) {
+	t.Setenv("CC_SESSION_ID", "s1")
+
+	req, _, err := parseSendArgs([]string{"--session", "webnew:web-admin:proj::s1", "done"})
+	if err != nil {
+		t.Fatalf("parseSendArgs returned error: %v", err)
+	}
+	if req.SessionKey != "webnew:web-admin:proj::s1" {
+		t.Fatalf("session = %q, want full explicit session key", req.SessionKey)
+	}
+	if req.SessionID != "" {
+		t.Fatalf("sessionID = %q, want empty for explicit session", req.SessionID)
+	}
+}
+
+func TestParseSendArgs_DataDirFlagOverridesEnv(t *testing.T) {
+	t.Setenv("CC_CONNECT_DATA_DIR", "/tmp/from-env")
+
+	req, dataDir, err := parseSendArgs([]string{"--data-dir", "/tmp/from-flag", "done"})
+	if err != nil {
+		t.Fatalf("parseSendArgs returned error: %v", err)
+	}
+	if req.Message != "done" {
+		t.Fatalf("message = %q, want done", req.Message)
+	}
+	if dataDir != "/tmp/from-flag" {
+		t.Fatalf("dataDir = %q, want /tmp/from-flag", dataDir)
 	}
 }
 
@@ -136,6 +174,7 @@ func TestBuildSendPayload_JSONRoundTrip(t *testing.T) {
 	req := core.SendRequest{
 		Project:    "demo",
 		SessionKey: "telegram:1:2",
+		SessionID:  "s1",
 		Message:    "done",
 		Images: []core.ImageAttachment{{
 			MimeType: "image/png",
@@ -163,5 +202,8 @@ func TestBuildSendPayload_JSONRoundTrip(t *testing.T) {
 	}
 	if len(decoded.Files) != 1 || string(decoded.Files[0].Data) != "doc" {
 		t.Fatalf("decoded files = %#v", decoded.Files)
+	}
+	if decoded.SessionID != "s1" {
+		t.Fatalf("decoded sessionID = %q, want s1", decoded.SessionID)
 	}
 }

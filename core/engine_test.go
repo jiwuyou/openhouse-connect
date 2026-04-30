@@ -1509,6 +1509,60 @@ func TestAgentSystemPrompt_MentionsAttachmentSend(t *testing.T) {
 	if !strings.Contains(prompt, "cc-connect send --file") {
 		t.Fatalf("prompt missing file send instructions: %q", prompt)
 	}
+	if !strings.Contains(prompt, "CC_CONNECT_DATA_DIR") {
+		t.Fatalf("prompt missing data dir env instructions: %q", prompt)
+	}
+	if !strings.Contains(prompt, "Do NOT manually add --project, --session, or --data-dir to cc-connect send") {
+		t.Fatalf("prompt should discourage manual targeting flags: %q", prompt)
+	}
+}
+
+func TestHandleMessage_InjectsCurrentSessionEnv(t *testing.T) {
+	p := &stubPlatformEngine{n: "webnew"}
+	agent := &sessionEnvRecordingAgent{session: newResultAgentSession("ok")}
+	e := NewEngine("demo-project", agent, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+
+	dataDir := t.TempDir()
+	e.SetDataDir(dataDir)
+
+	sessionKey := "webnew:web-admin:demo-project"
+	session := e.sessions.NewSession(sessionKey, "main")
+	e.handleMessage(p, &Message{
+		SessionKey: sessionKey,
+		SessionID:  session.ID,
+		Platform:   "webnew",
+		UserID:     "web-admin",
+		UserName:   "admin",
+		Content:    "hello",
+		ReplyCtx:   "ctx",
+	})
+
+	deadline := time.After(2 * time.Second)
+	for {
+		if got := agent.EnvValue("CC_SESSION_KEY"); got != "" {
+			if got != sessionKey {
+				t.Fatalf("CC_SESSION_KEY = %q, want %q", got, sessionKey)
+			}
+			if got := agent.EnvValue("CC_PROJECT"); got != "demo-project" {
+				t.Fatalf("CC_PROJECT = %q, want %q", got, "demo-project")
+			}
+			if got := agent.EnvValue("CC_SESSION_ID"); got != session.ID {
+				t.Fatalf("CC_SESSION_ID = %q, want %q", got, session.ID)
+			}
+			if got := agent.EnvValue("CC_CONNECT_DATA_DIR"); got != dataDir {
+				t.Fatalf("CC_CONNECT_DATA_DIR = %q, want %q", got, dataDir)
+			}
+			return
+		}
+
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for session env injection")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 }
 
 func countCardActionValues(card *Card, prefix string) int {

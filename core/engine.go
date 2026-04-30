@@ -204,6 +204,7 @@ type Engine struct {
 	relayManager     *RelayManager
 	eventIdleTimeout time.Duration
 	dirHistory       *DirHistory
+	dataDir          string
 	baseWorkDir      string
 	projectState     *ProjectStateStore
 
@@ -860,6 +861,36 @@ func (e *Engine) SetDirHistory(dh *DirHistory) {
 
 func (e *Engine) SetBaseWorkDir(dir string) {
 	e.baseWorkDir = dir
+}
+
+func (e *Engine) SetDataDir(dir string) {
+	e.dataDir = dir
+}
+
+func (e *Engine) DataDir() string {
+	return e.dataDir
+}
+
+func (e *Engine) agentSessionEnv(sessionKey, sessionID string) []string {
+	envVars := []string{
+		"CC_PROJECT=" + e.name,
+		"CC_SESSION_KEY=" + sessionKey,
+	}
+	if sessionID != "" {
+		envVars = append(envVars, "CC_SESSION_ID="+sessionID)
+	}
+	if e.dataDir != "" {
+		envVars = append(envVars, "CC_CONNECT_DATA_DIR="+e.dataDir)
+	}
+	if exePath, err := os.Executable(); err == nil {
+		binDir := filepath.Dir(exePath)
+		if curPath := os.Getenv("PATH"); curPath != "" {
+			envVars = append(envVars, "PATH="+binDir+string(filepath.ListSeparator)+curPath)
+		} else {
+			envVars = append(envVars, "PATH="+binDir)
+		}
+	}
+	return envVars
 }
 
 func (e *Engine) SetDisplayName(name string) {
@@ -2500,20 +2531,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 
 	// Inject per-session env vars so the agent subprocess can call `cc-connect cron add` etc.
 	if inj, ok := agent.(SessionEnvInjector); ok {
-		envVars := []string{
-			"CC_PROJECT=" + e.name,
-			"CC_SESSION_KEY=" + ccKey,
-			"CC_SESSION_ID=" + session.ID,
-		}
-		if exePath, err := os.Executable(); err == nil {
-			binDir := filepath.Dir(exePath)
-			if curPath := os.Getenv("PATH"); curPath != "" {
-				envVars = append(envVars, "PATH="+binDir+string(filepath.ListSeparator)+curPath)
-			} else {
-				envVars = append(envVars, "PATH="+binDir)
-			}
-		}
-		inj.SetSessionEnv(envVars)
+		inj.SetSessionEnv(e.agentSessionEnv(ccKey, session.ID))
 	}
 
 	// Inject platform-specific formatting instructions into the agent's system prompt.
@@ -11094,17 +11112,7 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 	session := e.sessions.GetOrCreateActive(relaySessionKey)
 
 	if inj, ok := e.agent.(SessionEnvInjector); ok {
-		envVars := []string{
-			"CC_PROJECT=" + e.name,
-			"CC_SESSION_KEY=" + relaySessionKey,
-		}
-		if exePath, err := os.Executable(); err == nil {
-			binDir := filepath.Dir(exePath)
-			if curPath := os.Getenv("PATH"); curPath != "" {
-				envVars = append(envVars, "PATH="+binDir+string(filepath.ListSeparator)+curPath)
-			}
-		}
-		inj.SetSessionEnv(envVars)
+		inj.SetSessionEnv(e.agentSessionEnv(relaySessionKey, session.ID))
 	}
 
 	// Use the engine context (not the relay timeout context) so that the

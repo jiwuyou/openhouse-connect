@@ -74,6 +74,7 @@ func parseSendArgs(args []string) (core.SendRequest, string, error) {
 	var imagePaths []string
 	var filePaths []string
 	var positional []string
+	var explicitSession bool
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -89,6 +90,7 @@ func parseSendArgs(args []string) (core.SendRequest, string, error) {
 			}
 			i++
 			req.SessionKey = args[i]
+			explicitSession = true
 		case "--message", "-m":
 			if i+1 >= len(args) {
 				return req, "", fmt.Errorf("--message requires a value")
@@ -134,9 +136,17 @@ func parseSendArgs(args []string) (core.SendRequest, string, error) {
 	}
 	if req.SessionKey == "" {
 		req.SessionKey = strings.TrimSpace(os.Getenv("CC_SESSION_KEY"))
+		if req.SessionID == "" {
+			req.SessionID = strings.TrimSpace(os.Getenv("CC_SESSION_ID"))
+		}
+	} else if explicitSession {
+		req.SessionID = ""
 	}
 	if req.Message == "" {
 		req.Message = strings.Join(positional, " ")
+	}
+	if dataDir == "" {
+		dataDir = strings.TrimSpace(os.Getenv("CC_CONNECT_DATA_DIR"))
 	}
 
 	images, err := loadImageAttachments(imagePaths)

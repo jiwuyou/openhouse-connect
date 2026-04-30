@@ -30,6 +30,7 @@ type APIServer struct {
 type SendRequest struct {
 	Project    string            `json:"project"`
 	SessionKey string            `json:"session_key"`
+	SessionID  string            `json:"session_id,omitempty"`
 	Message    string            `json:"message"`
 	Images     []ImageAttachment `json:"images,omitempty"`
 	Files      []FileAttachment  `json:"files,omitempty"`
@@ -167,7 +168,13 @@ func (s *APIServer) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := engine.SendToSessionWithAttachments(req.SessionKey, req.Message, req.Images, req.Files); err != nil {
+	var err error
+	if req.SessionID != "" {
+		err = engine.SendToSessionWithSessionIDAndAttachments(req.SessionKey, req.SessionID, req.Message, req.Images, req.Files)
+	} else {
+		err = engine.SendToSessionWithAttachments(req.SessionKey, req.Message, req.Images, req.Files)
+	}
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

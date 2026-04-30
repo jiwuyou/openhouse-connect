@@ -145,6 +145,32 @@ func TestBuildAgentOptionsInjectsProjectScope(t *testing.T) {
 	}
 }
 
+func TestBuildProjectRuntimePassesDataDirToEngine(t *testing.T) {
+	dataDir := t.TempDir()
+	workDir := t.TempDir()
+	agentName := "stub-main-data-dir"
+	core.RegisterAgent(agentName, func(map[string]any) (core.Agent, error) {
+		return &stubMainAgent{}, nil
+	})
+
+	runtime, err := buildProjectRuntime(&config.Config{
+		DataDir:  dataDir,
+		Language: "en",
+	}, config.ProjectConfig{
+		Name: "demo-project",
+		Agent: config.AgentConfig{
+			Type:    agentName,
+			Options: map[string]any{"work_dir": workDir},
+		},
+	}, filepath.Join(t.TempDir(), "config.toml"), false, "")
+	if err != nil {
+		t.Fatalf("buildProjectRuntime() error = %v", err)
+	}
+	if got := runtime.engine.DataDir(); got != dataDir {
+		t.Fatalf("engine DataDir = %q, want %q", got, dataDir)
+	}
+}
+
 func TestWireAgentProvidersStartsRefreshAfterProviderWiring(t *testing.T) {
 	agent := &stubProviderRefreshAgent{activateOK: true}
 	proj := config.ProjectConfig{

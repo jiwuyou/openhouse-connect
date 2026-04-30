@@ -1005,6 +1005,7 @@ func buildProjectRuntime(cfg *config.Config, proj config.ProjectConfig, configPa
 
 	lang := parseLanguage(cfg.Language)
 	engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang)
+	engine.SetDataDir(cfg.DataDir)
 	engine.SetDisplayName(proj.DisplayName)
 	showCtx := true
 	if proj.ShowContextIndicator != nil {
