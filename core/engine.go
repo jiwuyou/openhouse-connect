@@ -44,10 +44,18 @@ const (
 	slowAgentFirstEvent = 15 * time.Second // time from send to first agent event
 )
 
+var (
+	defaultOutboxPollInterval = 500 * time.Millisecond
+	defaultOutboxStableFor    = 500 * time.Millisecond
+)
+
 const (
 	replyFooterUsageTimeout  = 1500 * time.Millisecond
 	replyFooterUsageCacheTTL = 30 * time.Second
 )
+
+const maxOutboxAttachmentBytes = 50 << 20 // 50 MB
+const outboxStopTimeout = 500 * time.Millisecond
 
 // VersionInfo is set by main at startup so that /version works.
 var VersionInfo string
@@ -278,6 +286,8 @@ type interactiveState struct {
 	replyCtx               any
 	workspaceDir           string
 	agent                  Agent
+	ccSessionKey           string
+	ccSessionID            string
 	mu                     sync.Mutex
 	stopCh                 chan struct{}
 	stopped                bool
@@ -291,6 +301,8 @@ type interactiveState struct {
 	pendingProviderAdd     *pendingProviderAddState
 	lastAutoCompressAt     time.Time
 	lastAutoCompressTokens int
+	outboxWatcher          *OutboxWatcher
+	outboxCancel           context.CancelFunc
 }
 
 type pendingProviderAddState struct {
@@ -347,16 +359,53 @@ func (s *interactiveState) isStopped() bool {
 }
 
 func (s *interactiveState) markStopped() {
+	s.markStoppedWithOutboxWait(false)
+}
+
+func (s *interactiveState) markStoppedAndWait() {
+	s.markStoppedWithOutboxWait(true)
+}
+
+func (s *interactiveState) markStoppedWithOutboxWait(wait bool) {
+	s.mu.Lock()
+	if !s.stopped {
+		s.stopped = true
+		if s.stopCh == nil {
+			s.stopCh = make(chan struct{})
+		}
+		close(s.stopCh)
+	}
+	watcher := s.outboxWatcher
+	cancel := s.outboxCancel
+	s.outboxWatcher = nil
+	s.outboxCancel = nil
+	s.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if watcher != nil {
+		if wait {
+			if !watcher.StopWithTimeout(outboxStopTimeout) {
+				slog.Warn("outbox watcher stop timed out", "timeout", outboxStopTimeout)
+			}
+		} else {
+			go watcher.Stop()
+		}
+	}
+}
+
+func (s *interactiveState) setCCTarget(sessionKey, sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.stopped {
-		return
-	}
-	s.stopped = true
-	if s.stopCh == nil {
-		s.stopCh = make(chan struct{})
-	}
-	close(s.stopCh)
+	s.ccSessionKey = sessionKey
+	s.ccSessionID = sessionID
+}
+
+func (s *interactiveState) matchesCCTarget(sessionKey, sessionID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ccSessionKey == sessionKey && s.ccSessionID == sessionID
 }
 
 // resolve safely closes the Resolved channel exactly once.
@@ -871,7 +920,25 @@ func (e *Engine) DataDir() string {
 	return e.dataDir
 }
 
-func (e *Engine) agentSessionEnv(sessionKey, sessionID string) []string {
+func (e *Engine) sessionOutboxDirForTarget(runtimeKey, sessionKey, sessionID string) string {
+	if strings.TrimSpace(e.dataDir) == "" || strings.TrimSpace(sessionID) == "" {
+		return ""
+	}
+	return SessionOutboxDir(e.dataDir, e.name, uniqueOutboxSessionID(runtimeKey, sessionKey, sessionID))
+}
+
+func uniqueOutboxSessionID(runtimeKey, sessionKey, sessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	scope := strings.Join([]string{
+		strings.TrimSpace(runtimeKey),
+		strings.TrimSpace(sessionKey),
+		sessionID,
+	}, "\x00")
+	sum := sha256.Sum256([]byte(scope))
+	return hex.EncodeToString(sum[:8]) + "-" + sessionID
+}
+
+func (e *Engine) agentSessionEnv(runtimeKey, sessionKey, sessionID string) []string {
 	envVars := []string{
 		"CC_PROJECT=" + e.name,
 		"CC_SESSION_KEY=" + sessionKey,
@@ -882,6 +949,9 @@ func (e *Engine) agentSessionEnv(sessionKey, sessionID string) []string {
 	if e.dataDir != "" {
 		envVars = append(envVars, "CC_CONNECT_DATA_DIR="+e.dataDir)
 	}
+	if outboxDir := e.sessionOutboxDirForTarget(runtimeKey, sessionKey, sessionID); outboxDir != "" {
+		envVars = append(envVars, "CC_CONNECT_OUTBOX="+outboxDir)
+	}
 	if exePath, err := os.Executable(); err == nil {
 		binDir := filepath.Dir(exePath)
 		if curPath := os.Getenv("PATH"); curPath != "" {
@@ -891,6 +961,134 @@ func (e *Engine) agentSessionEnv(sessionKey, sessionID string) []string {
 		}
 	}
 	return envVars
+}
+
+func (e *Engine) ensureOutboxWatcher(state *interactiveState, runtimeKey, sessionKey, sessionID string) {
+	if state == nil {
+		return
+	}
+	outboxDir := e.sessionOutboxDirForTarget(runtimeKey, sessionKey, sessionID)
+	if outboxDir == "" {
+		return
+	}
+
+	state.mu.Lock()
+	if state.stopped || state.outboxWatcher != nil {
+		state.mu.Unlock()
+		return
+	}
+	watcherCtx, cancel := context.WithCancel(e.ctx)
+	watcher := NewOutboxWatcher(OutboxWatcherConfig{
+		Dir:          outboxDir,
+		PollInterval: defaultOutboxPollInterval,
+		StableFor:    defaultOutboxStableFor,
+		MaxBytes:     maxOutboxAttachmentBytes,
+		Deliver: func(ctx context.Context, item OutboxItem) error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+			if state.isStopped() {
+				return context.Canceled
+			}
+			return e.deliverOutboxItemToState(ctx, state, item)
+		},
+	})
+	state.outboxWatcher = watcher
+	state.outboxCancel = cancel
+	state.mu.Unlock()
+
+	watcher.Start(watcherCtx)
+}
+
+func (e *Engine) deliverOutboxItemToState(ctx context.Context, state *interactiveState, item OutboxItem) error {
+	var images []ImageAttachment
+	if item.Image != nil {
+		images = append(images, *item.Image)
+	}
+	var files []FileAttachment
+	if item.File != nil {
+		files = append(files, *item.File)
+	}
+	if len(images) == 0 && len(files) == 0 {
+		return fmt.Errorf("outbox item %q has no deliverable attachment", item.Path)
+	}
+	if !e.attachmentSendEnabled {
+		return ErrAttachmentSendDisabled
+	}
+
+	state.mu.Lock()
+	p := state.platform
+	replyCtx := state.replyCtx
+	stopped := state.stopped
+	state.mu.Unlock()
+	if stopped {
+		return context.Canceled
+	}
+	if p == nil {
+		return fmt.Errorf("outbox target platform is unavailable")
+	}
+
+	var imageSender ImageSender
+	if len(images) > 0 {
+		var ok bool
+		imageSender, ok = p.(ImageSender)
+		if !ok {
+			return fmt.Errorf("platform %s: %w", p.Name(), ErrNotSupported)
+		}
+	}
+
+	var fileSender FileSender
+	if len(files) > 0 {
+		var ok bool
+		fileSender, ok = p.(FileSender)
+		if !ok {
+			return fmt.Errorf("platform %s: %w", p.Name(), ErrNotSupported)
+		}
+	}
+
+	for _, img := range images {
+		if err := checkOutboxDeliveryActive(ctx, state); err != nil {
+			return err
+		}
+		if err := e.waitOutgoingContext(ctx, p); err != nil {
+			return err
+		}
+		if err := checkOutboxDeliveryActive(ctx, state); err != nil {
+			return err
+		}
+		if err := imageSender.SendImage(ctx, replyCtx, img); err != nil {
+			return err
+		}
+	}
+	for _, file := range files {
+		if err := checkOutboxDeliveryActive(ctx, state); err != nil {
+			return err
+		}
+		if err := e.waitOutgoingContext(ctx, p); err != nil {
+			return err
+		}
+		if err := checkOutboxDeliveryActive(ctx, state); err != nil {
+			return err
+		}
+		if err := fileSender.SendFile(ctx, replyCtx, file); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkOutboxDeliveryActive(ctx context.Context, state *interactiveState) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	if state.isStopped() {
+		return context.Canceled
+	}
+	return nil
 }
 
 func (e *Engine) SetDisplayName(name string) {
@@ -1445,6 +1643,7 @@ func (e *Engine) Stop() error {
 	e.interactiveMu.Unlock()
 
 	for key, state := range states {
+		state.markStoppedAndWait()
 		if state.agentSession != nil {
 			slog.Debug("engine.Stop: closing agent session", "session", key)
 			state.agentSession.Close()
@@ -2487,6 +2686,11 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	e.interactiveMu.Lock()
 	defer e.interactiveMu.Unlock()
 
+	ccKey := sessionKey
+	if ccSessionKey != "" {
+		ccKey = ccSessionKey
+	}
+
 	state, ok := e.interactiveStates[sessionKey]
 	if ok && state.agentSession != nil && state.agentSession.Alive() {
 		// Verify the running agent session matches the current active session.
@@ -2502,6 +2706,8 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		// a concrete ID, reusing would keep --resume context — recycle (#238).
 		needRecycle := currentID != "" && (wantID == "" || wantID != currentID)
 		if !needRecycle {
+			state.setCCTarget(ccKey, session.ID)
+			e.ensureOutboxWatcher(state, sessionKey, ccKey, session.ID)
 			return state
 		}
 		// Tear down the stale agent so we start one that matches the Session below.
@@ -2524,14 +2730,9 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		agent = agentOverride
 	}
 
-	ccKey := sessionKey
-	if ccSessionKey != "" {
-		ccKey = ccSessionKey
-	}
-
 	// Inject per-session env vars so the agent subprocess can call `cc-connect cron add` etc.
 	if inj, ok := agent.(SessionEnvInjector); ok {
-		inj.SetSessionEnv(e.agentSessionEnv(ccKey, session.ID))
+		inj.SetSessionEnv(e.agentSessionEnv(sessionKey, ccKey, session.ID))
 	}
 
 	// Inject platform-specific formatting instructions into the agent's system prompt.
@@ -2548,7 +2749,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	// Check if context is already canceled (e.g. during shutdown/restart)
 	if e.ctx.Err() != nil {
 		slog.Debug("skipping session start: context canceled", "session_key", sessionKey)
-		newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent}
+		newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, ccSessionKey: ccKey, ccSessionID: session.ID}
 		adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
 		state = newState
 		e.interactiveStates[sessionKey] = state
@@ -2579,7 +2780,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		}
 		if err != nil {
 			slog.Error("failed to start interactive session", "error", err, "elapsed", startElapsed)
-			newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent}
+			newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, ccSessionKey: ccKey, ccSessionID: session.ID}
 			adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
 			state = newState
 			e.interactiveStates[sessionKey] = state
@@ -2601,10 +2802,13 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		platform:     p,
 		replyCtx:     replyCtx,
 		agent:        agent,
+		ccSessionKey: ccKey,
+		ccSessionID:  session.ID,
 	}
 	adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
 	state = newState
 	e.interactiveStates[sessionKey] = state
+	e.ensureOutboxWatcher(state, sessionKey, ccKey, session.ID)
 
 	slog.Info("session spawned", "session_key", sessionKey, "agent_session", session.GetAgentSessionID(), "is_resume", isResume, "elapsed", startElapsed)
 	return state
@@ -2638,7 +2842,7 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 
 	// Notify senders of any queued messages that will never be processed.
 	if ok && state != nil {
-		state.markStopped()
+		state.markStoppedAndWait()
 		e.notifyDroppedQueuedMessages(state, fmt.Errorf("session reset"))
 	}
 
@@ -6533,10 +6737,10 @@ func (e *Engine) stopInteractiveSession(sessionKey string, quietPlatform Platfor
 	agentSession := state.agentSession
 	state.mu.Unlock()
 
-	state.markStopped()
 	delete(e.interactiveStates, sessionKey)
 	e.interactiveMu.Unlock()
 
+	state.markStoppedAndWait()
 	if pending != nil {
 		pending.resolve()
 	}
@@ -7243,7 +7447,17 @@ func (e *Engine) sendToSessionWithSessionID(sessionKey, sessionID, message strin
 
 	var state *interactiveState
 	if sessionKey != "" && strings.TrimSpace(sessionID) != "" {
-		state = e.interactiveStates[interactiveKeyWithSessionID(e.interactiveKeyForSessionKey(sessionKey), sessionID)]
+		baseKey := e.interactiveKeyForSessionKey(sessionKey)
+		state = e.interactiveStates[interactiveKeyWithSessionID(baseKey, sessionID)]
+		if state == nil {
+			for _, fallbackKey := range []string{baseKey, sessionKey} {
+				candidate := e.interactiveStates[fallbackKey]
+				if candidate != nil && candidate.matchesCCTarget(sessionKey, sessionID) {
+					state = candidate
+					break
+				}
+			}
+		}
 	} else if sessionKey != "" {
 		state = e.interactiveStates[sessionKey]
 		if state == nil && e.multiWorkspace {
@@ -7541,10 +7755,14 @@ func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []Use
 
 // waitOutgoing blocks on the per-platform outgoing rate limiter when enabled.
 func (e *Engine) waitOutgoing(p Platform) error {
+	return e.waitOutgoingContext(e.ctx, p)
+}
+
+func (e *Engine) waitOutgoingContext(ctx context.Context, p Platform) error {
 	if e.outgoingRL == nil {
 		return nil
 	}
-	return e.outgoingRL.Wait(e.ctx, p.Name())
+	return e.outgoingRL.Wait(ctx, p.Name())
 }
 
 func (e *Engine) renderOutgoingContentForWorkspace(p Platform, content, workspaceDir string) string {
@@ -11112,7 +11330,7 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 	session := e.sessions.GetOrCreateActive(relaySessionKey)
 
 	if inj, ok := e.agent.(SessionEnvInjector); ok {
-		inj.SetSessionEnv(e.agentSessionEnv(relaySessionKey, session.ID))
+		inj.SetSessionEnv(e.agentSessionEnv(relaySessionKey, relaySessionKey, session.ID))
 	}
 
 	// Use the engine context (not the relay timeout context) so that the

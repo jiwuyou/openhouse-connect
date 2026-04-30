@@ -271,18 +271,62 @@ func (p *blockingRegisterPlatform) Stop() error {
 
 type stubMediaPlatform struct {
 	stubPlatformEngine
-	images []ImageAttachment
-	files  []FileAttachment
+	mediaMu sync.Mutex
+	images  []ImageAttachment
+	files   []FileAttachment
 }
 
 func (p *stubMediaPlatform) SendImage(_ context.Context, _ any, img ImageAttachment) error {
+	p.mediaMu.Lock()
+	defer p.mediaMu.Unlock()
 	p.images = append(p.images, img)
 	return nil
 }
 
 func (p *stubMediaPlatform) SendFile(_ context.Context, _ any, file FileAttachment) error {
+	p.mediaMu.Lock()
+	defer p.mediaMu.Unlock()
 	p.files = append(p.files, file)
 	return nil
+}
+
+func (p *stubMediaPlatform) getImages() []ImageAttachment {
+	p.mediaMu.Lock()
+	defer p.mediaMu.Unlock()
+	out := make([]ImageAttachment, len(p.images))
+	copy(out, p.images)
+	return out
+}
+
+func (p *stubMediaPlatform) getFiles() []FileAttachment {
+	p.mediaMu.Lock()
+	defer p.mediaMu.Unlock()
+	out := make([]FileAttachment, len(p.files))
+	copy(out, p.files)
+	return out
+}
+
+type blockingOutboxImagePlatform struct {
+	stubPlatformEngine
+	startOnce sync.Once
+	doneOnce  sync.Once
+	started   chan struct{}
+	done      chan struct{}
+}
+
+func newBlockingOutboxImagePlatform(name string) *blockingOutboxImagePlatform {
+	return &blockingOutboxImagePlatform{
+		stubPlatformEngine: stubPlatformEngine{n: name},
+		started:            make(chan struct{}),
+		done:               make(chan struct{}),
+	}
+}
+
+func (p *blockingOutboxImagePlatform) SendImage(ctx context.Context, _ any, _ ImageAttachment) error {
+	p.startOnce.Do(func() { close(p.started) })
+	<-ctx.Done()
+	p.doneOnce.Do(func() { close(p.done) })
+	return ctx.Err()
 }
 
 type stubInlineButtonPlatform struct {
@@ -1512,6 +1556,9 @@ func TestAgentSystemPrompt_MentionsAttachmentSend(t *testing.T) {
 	if !strings.Contains(prompt, "CC_CONNECT_DATA_DIR") {
 		t.Fatalf("prompt missing data dir env instructions: %q", prompt)
 	}
+	if !strings.Contains(prompt, "$CC_CONNECT_OUTBOX") {
+		t.Fatalf("prompt missing outbox instructions: %q", prompt)
+	}
 	if !strings.Contains(prompt, "Do NOT manually add --project, --session, or --data-dir to cc-connect send") {
 		t.Fatalf("prompt should discourage manual targeting flags: %q", prompt)
 	}
@@ -1553,6 +1600,11 @@ func TestHandleMessage_InjectsCurrentSessionEnv(t *testing.T) {
 			if got := agent.EnvValue("CC_CONNECT_DATA_DIR"); got != dataDir {
 				t.Fatalf("CC_CONNECT_DATA_DIR = %q, want %q", got, dataDir)
 			}
+			runtimeKey := interactiveKeyWithSessionID(sessionKey, session.ID)
+			wantOutbox := e.sessionOutboxDirForTarget(runtimeKey, sessionKey, session.ID)
+			if got := agent.EnvValue("CC_CONNECT_OUTBOX"); got != wantOutbox {
+				t.Fatalf("CC_CONNECT_OUTBOX = %q, want %q", got, wantOutbox)
+			}
 			return
 		}
 
@@ -1562,6 +1614,197 @@ func TestHandleMessage_InjectsCurrentSessionEnv(t *testing.T) {
 		default:
 			time.Sleep(10 * time.Millisecond)
 		}
+	}
+}
+
+func withFastOutboxWatcher(t *testing.T) {
+	t.Helper()
+	oldPoll := defaultOutboxPollInterval
+	oldStable := defaultOutboxStableFor
+	defaultOutboxPollInterval = 10 * time.Millisecond
+	defaultOutboxStableFor = 10 * time.Millisecond
+	t.Cleanup(func() {
+		defaultOutboxPollInterval = oldPoll
+		defaultOutboxStableFor = oldStable
+	})
+}
+
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			return strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return ""
+}
+
+func TestOutboxDelivery_DeliversImageAndFileThroughCapabilities(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "webnew"}}
+	e := NewEngine("demo-project", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	state := &interactiveState{platform: p, replyCtx: "ctx"}
+
+	err := e.deliverOutboxItemToState(context.Background(), state, OutboxItem{
+		Path: "chart.png",
+		Image: &ImageAttachment{
+			MimeType: "image/png",
+			Data:     []byte{0x89, 'P', 'N', 'G'},
+			FileName: "chart.png",
+		},
+	})
+	if err != nil {
+		t.Fatalf("deliver image returned error: %v", err)
+	}
+	err = e.deliverOutboxItemToState(context.Background(), state, OutboxItem{
+		Path: "report.txt",
+		File: &FileAttachment{
+			MimeType: "text/plain",
+			Data:     []byte("hello"),
+			FileName: "report.txt",
+		},
+	})
+	if err != nil {
+		t.Fatalf("deliver file returned error: %v", err)
+	}
+
+	images := p.getImages()
+	files := p.getFiles()
+	if len(images) != 1 || len(files) != 1 {
+		t.Fatalf("delivered images=%d files=%d, want 1 each", len(images), len(files))
+	}
+	if images[0].FileName != "chart.png" || images[0].MimeType != "image/png" {
+		t.Fatalf("image attachment = %#v", images[0])
+	}
+	if files[0].FileName != "report.txt" {
+		t.Fatalf("file attachment = %#v", files[0])
+	}
+}
+
+func TestOutboxDeliveryRequiresCapabilityInterfaces(t *testing.T) {
+	p := &stubPlatformEngine{n: "webnew"}
+	e := NewEngine("demo-project", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	state := &interactiveState{platform: p, replyCtx: "ctx"}
+
+	err := e.deliverOutboxItemToState(context.Background(), state, OutboxItem{
+		Path:  "chart.png",
+		Image: &ImageAttachment{MimeType: "image/png", Data: []byte("img"), FileName: "chart.png"},
+	})
+	if !errors.Is(err, ErrNotSupported) {
+		t.Fatalf("deliver image error = %v, want ErrNotSupported", err)
+	}
+}
+
+func TestSessionOutboxDir_IsolatesSameSessionIDAcrossRuntimeKeys(t *testing.T) {
+	e := NewEngine("demo-project", &stubAgent{}, nil, "", LangEnglish)
+	e.SetDataDir(t.TempDir())
+
+	ccKey := "webnew:web-admin:demo-project"
+	sessionID := "s1"
+	runtimeA := filepath.Join(t.TempDir(), "workspace-a") + ":" + interactiveKeyWithSessionID(ccKey, sessionID)
+	runtimeB := filepath.Join(t.TempDir(), "workspace-b") + ":" + interactiveKeyWithSessionID(ccKey, sessionID)
+	outboxA := e.sessionOutboxDirForTarget(runtimeA, ccKey, sessionID)
+	outboxB := e.sessionOutboxDirForTarget(runtimeB, ccKey, sessionID)
+	if outboxA == outboxB {
+		t.Fatalf("outbox dirs should differ for separate runtime keys with same session ID: %q", outboxA)
+	}
+
+	envA := e.agentSessionEnv(runtimeA, ccKey, sessionID)
+	envB := e.agentSessionEnv(runtimeB, ccKey, sessionID)
+	if got := envValue(envA, "CC_CONNECT_OUTBOX"); got != outboxA {
+		t.Fatalf("runtime A CC_CONNECT_OUTBOX = %q, want %q", got, outboxA)
+	}
+	if got := envValue(envB, "CC_CONNECT_OUTBOX"); got != outboxB {
+		t.Fatalf("runtime B CC_CONNECT_OUTBOX = %q, want %q", got, outboxB)
+	}
+}
+
+func TestOutboxWatcher_StartsOnceAndStopsOnInteractiveCleanup(t *testing.T) {
+	withFastOutboxWatcher(t)
+
+	e := NewEngine("demo-project", &stubAgent{}, nil, "", LangEnglish)
+	e.SetDataDir(t.TempDir())
+
+	runtimeKey := "workspace-a:webnew:web-admin:demo-project::s1"
+	ccKey := "webnew:web-admin:demo-project"
+	state := &interactiveState{}
+	e.interactiveMu.Lock()
+	e.interactiveStates[runtimeKey] = state
+	e.interactiveMu.Unlock()
+
+	e.ensureOutboxWatcher(state, runtimeKey, ccKey, "s1")
+	state.mu.Lock()
+	firstWatcher := state.outboxWatcher
+	firstCancel := state.outboxCancel
+	state.mu.Unlock()
+	if firstWatcher == nil || firstCancel == nil {
+		t.Fatal("expected outbox watcher to be initialized")
+	}
+
+	e.ensureOutboxWatcher(state, runtimeKey, ccKey, "s1")
+	state.mu.Lock()
+	secondWatcher := state.outboxWatcher
+	secondCancel := state.outboxCancel
+	state.mu.Unlock()
+	if secondWatcher != firstWatcher || secondCancel == nil {
+		t.Fatal("expected ensureOutboxWatcher to reuse the existing watcher for the state")
+	}
+
+	start := time.Now()
+	e.cleanupInteractiveState(runtimeKey)
+	if elapsed := time.Since(start); elapsed > outboxStopTimeout+500*time.Millisecond {
+		t.Fatalf("cleanup took %s, want bounded by outbox stop timeout", elapsed)
+	}
+
+	state.mu.Lock()
+	stopped := state.stopped
+	watcher := state.outboxWatcher
+	cancel := state.outboxCancel
+	state.mu.Unlock()
+	if !stopped {
+		t.Fatal("expected state to be marked stopped")
+	}
+	if watcher != nil || cancel != nil {
+		t.Fatal("expected cleanup to clear outbox watcher and cancel func")
+	}
+}
+
+func TestOutboxDelivery_CancelsInFlightDeliveryOnCleanup(t *testing.T) {
+	p := newBlockingOutboxImagePlatform("webnew")
+	e := NewEngine("demo-project", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	ctx, cancel := context.WithCancel(e.ctx)
+	runtimeKey := "webnew:web-admin:demo-project::s1"
+	state := &interactiveState{platform: p, replyCtx: "ctx", outboxCancel: cancel}
+	e.interactiveMu.Lock()
+	e.interactiveStates[runtimeKey] = state
+	e.interactiveMu.Unlock()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- e.deliverOutboxItemToState(ctx, state, OutboxItem{
+			Path:  "blocked.png",
+			Image: &ImageAttachment{MimeType: "image/png", Data: []byte("img"), FileName: "blocked.png"},
+		})
+	}()
+
+	select {
+	case <-p.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for blocking image send to start")
+	}
+
+	start := time.Now()
+	e.cleanupInteractiveState(runtimeKey)
+	if elapsed := time.Since(start); elapsed > outboxStopTimeout+500*time.Millisecond {
+		t.Fatalf("cleanup took %s, want bounded by outbox stop timeout", elapsed)
+	}
+
+	select {
+	case <-p.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for blocking image send to observe cancellation")
+	}
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("delivery error = %v, want context.Canceled", err)
 	}
 }
 
@@ -2528,6 +2771,32 @@ func TestSendToSessionWithSessionIDTargetsSpecificInteractiveState(t *testing.T)
 	}
 	if err := e.SendToSessionWithSessionID(key, "missing", "lost"); err == nil {
 		t.Fatal("expected missing targeted session runtime state to fail")
+	}
+}
+
+func TestSendToSessionWithSessionIDFallsBackToMatchingLegacyState(t *testing.T) {
+	key := "telegram:chat:user"
+	p := &stubPlatformEngine{n: "telegram"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	session := e.sessions.NewSession(key, "main")
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{
+		platform:     p,
+		replyCtx:     "ctx",
+		ccSessionKey: key,
+		ccSessionID:  session.ID,
+	}
+	e.interactiveMu.Unlock()
+
+	if err := e.SendToSessionWithSessionID(key, session.ID, "legacy targeted"); err != nil {
+		t.Fatalf("SendToSessionWithSessionID returned error: %v", err)
+	}
+	if got := p.getSent(); len(got) != 1 || got[0] != "legacy targeted" {
+		t.Fatalf("sent = %v, want legacy targeted", got)
+	}
+	if err := e.SendToSessionWithSessionID(key, "missing", "lost"); err == nil {
+		t.Fatal("expected mismatched legacy session id to fail")
 	}
 }
 

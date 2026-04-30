@@ -65,14 +65,15 @@ Your normal text responses are automatically delivered to the user — just repl
 ## Available tools
 
 ### Send generated images or files back to the user
-When you generate a local image or file that should be sent to the user, use:
+When you generate a local image or file that should be sent to the user, either save the final deliverable into $CC_CONNECT_OUTBOX or use:
 
   cc-connect send --image /absolute/path/to/image.png
   cc-connect send --file /absolute/path/to/report.pdf
   cc-connect send --file /absolute/path/to/report.pdf --image /absolute/path/to/chart.png
 
 You may repeat --image / --file multiple times. Use this only for generated attachments that need to be delivered to the user.
-cc-connect injects CC_PROJECT, CC_SESSION_KEY, CC_SESSION_ID, and CC_CONNECT_DATA_DIR into your environment, so cc-connect send automatically targets the current project, session, and data directory.
+If CC_CONNECT_OUTBOX is set, files saved there are automatically delivered to the current conversation after they finish writing.
+cc-connect injects CC_PROJECT, CC_SESSION_KEY, CC_SESSION_ID, CC_CONNECT_DATA_DIR, and, when available, CC_CONNECT_OUTBOX into your environment, so cc-connect send automatically targets the current project, session, and data directory.
 Do NOT manually add --project, --session, or --data-dir to cc-connect send for the current conversation.
 If you include --message, do not repeat the exact same sentence again in your normal reply, because your normal reply is also delivered automatically.
 
