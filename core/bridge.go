@@ -218,6 +218,7 @@ type bridgeImageData struct {
 	MimeType string `json:"mime_type"`
 	Data     string `json:"data"` // base64
 	FileName string `json:"file_name,omitempty"`
+	Size     int    `json:"size,omitempty"`
 }
 
 type bridgeFileData struct {
@@ -416,6 +417,7 @@ var (
 	_ PreviewStarter             = (*BridgePlatform)(nil)
 	_ PreviewCleaner             = (*BridgePlatform)(nil)
 	_ TypingIndicator            = (*BridgePlatform)(nil)
+	_ ImageSender                = (*BridgePlatform)(nil)
 	_ AudioSender                = (*BridgePlatform)(nil)
 	_ CardNavigable              = (*BridgePlatform)(nil)
 	_ CardNavigableWithSessionID = (*BridgePlatform)(nil)
@@ -760,6 +762,26 @@ func (bp *BridgePlatform) SendAudio(ctx context.Context, replyCtx any, audio []b
 	return bp.server.sendToReplyTarget(rc, payload)
 }
 
+func (bp *BridgePlatform) SendImage(ctx context.Context, replyCtx any, img ImageAttachment) error {
+	rc, ok := replyCtx.(*bridgeReplyCtx)
+	if !ok {
+		return fmt.Errorf("bridge: invalid reply context")
+	}
+	a := bp.server.getAdapter(rc.Platform)
+	if a == nil || !a.capabilities["image"] {
+		return ErrNotSupported
+	}
+	images := HistoryImagesFromAttachments([]ImageAttachment{img})
+	if len(images) == 0 {
+		return fmt.Errorf("bridge: image data is required")
+	}
+	payload := bridgeOutboundBase("image", rc)
+	payload["reply_ctx"] = rc.ReplyCtx
+	payload["image"] = images[0]
+	payload["images"] = images
+	return bp.server.sendToReplyTarget(rc, payload)
+}
+
 func (bp *BridgePlatform) SetCardNavigationHandler(h CardNavigationHandler) {
 	bp.navHandler = h
 }
@@ -1086,6 +1108,7 @@ func (a *bridgeAdapter) handleMessageFromClient(raw json.RawMessage, client *bri
 		return
 	}
 
+	rc := newBridgeReplyCtxWithFrontendClient(a, m.SessionKey, m.SessionID, m.ReplyCtx, m.TransportSessionKey, m.Route, client)
 	msg := &Message{
 		SessionKey: m.SessionKey,
 		SessionID:  m.SessionID,
@@ -1094,19 +1117,16 @@ func (a *bridgeAdapter) handleMessageFromClient(raw json.RawMessage, client *bri
 		UserID:     m.UserID,
 		UserName:   m.UserName,
 		Content:    m.Content,
-		ReplyCtx:   newBridgeReplyCtxWithFrontendClient(a, m.SessionKey, m.SessionID, m.ReplyCtx, m.TransportSessionKey, m.Route, client),
+		ReplyCtx:   rc,
 	}
 
-	for _, img := range m.Images {
-		data, err := base64.StdEncoding.DecodeString(img.Data)
-		if err != nil {
-			slog.Debug("bridge: invalid image base64", "error", err)
-			continue
-		}
-		msg.Images = append(msg.Images, ImageAttachment{
-			MimeType: img.MimeType, Data: data, FileName: img.FileName,
-		})
+	images, err := bridgeImagesToAttachments(m.Images)
+	if err != nil {
+		slog.Warn("bridge: rejecting message with invalid images", "platform", a.platform, "session_key", m.SessionKey, "error", err)
+		a.sendError("invalid_images", err.Error(), rc)
+		return
 	}
+	msg.Images = images
 
 	for _, f := range m.Files {
 		data, err := base64.StdEncoding.DecodeString(f.Data)
@@ -1135,6 +1155,41 @@ func (a *bridgeAdapter) handleMessageFromClient(raw json.RawMessage, client *bri
 
 	if ref.platform.handler != nil {
 		ref.platform.handler(ref.platform, msg)
+	}
+}
+
+func bridgeImagesToAttachments(images []bridgeImageData) ([]ImageAttachment, error) {
+	if len(images) == 0 {
+		return nil, nil
+	}
+	if err := validateImageAttachmentCount(len(images)); err != nil {
+		return nil, err
+	}
+	out := make([]ImageAttachment, 0, len(images))
+	for i, img := range images {
+		attachment, err := imageAttachmentFromBase64(img.MimeType, img.Data, img.FileName)
+		if err != nil {
+			return nil, fmt.Errorf("image %d: %w", i+1, err)
+		}
+		out = append(out, attachment)
+	}
+	return out, nil
+}
+
+func (a *bridgeAdapter) sendError(code, message string, rc *bridgeReplyCtx) {
+	payload := map[string]any{
+		"type":    "error",
+		"code":    code,
+		"message": message,
+	}
+	if rc != nil && strings.TrimSpace(rc.SessionKey) != "" {
+		payload["session_key"] = rc.SessionKey
+	}
+	if rc != nil && strings.TrimSpace(rc.SessionID) != "" {
+		payload["session_id"] = rc.SessionID
+	}
+	if err := a.server.sendToReplyTarget(rc, payload); err != nil {
+		slog.Debug("bridge: write error payload failed", "platform", a.platform, "error", err)
 	}
 }
 
@@ -1422,10 +1477,7 @@ func (bs *BridgeServer) handleSessionRoutes(w http.ResponseWriter, r *http.Reque
 		hist := s.GetHistory(histLimit)
 		histJSON := make([]map[string]any, len(hist))
 		for i, h := range hist {
-			histJSON[i] = map[string]any{
-				"role":    h.Role,
-				"content": h.Content,
-			}
+			histJSON[i] = historyEntryMap(h, false)
 		}
 		bridgeJSON(w, http.StatusOK, map[string]any{
 			"id":          s.ID,
@@ -1701,6 +1753,7 @@ func bridgeCapabilitiesMap(capabilities []string) map[string]bool {
 func bridgeDefaultFrontendCapabilities() map[string]bool {
 	return bridgeCapabilitiesMap([]string{
 		"text",
+		"image",
 		"card",
 		"buttons",
 		"typing",

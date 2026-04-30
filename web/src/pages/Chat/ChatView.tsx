@@ -16,10 +16,20 @@ import {
 import CommandPalette, { type SlashCommand, slashCommands } from './CommandPalette';
 import SessionDrawer from './SessionDrawer';
 import CommandResultPanel, { type CommandResult } from './CommandResultPanel';
+import { ImageAttachmentGrid, ImageAttachmentPreview } from '@/components/ImageAttachments';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { cn } from '@/lib/utils';
+import {
+  ALLOWED_IMAGE_MIME_TYPES,
+  MAX_IMAGE_ATTACHMENTS,
+  normalizeBridgeImageMessage,
+  normalizeImageAttachments,
+  readImageFiles,
+  toBridgeImagePayload,
+  type WebImageAttachment,
+} from '@/lib/attachments';
 import {
   frontendServicePlatformForSlot,
   frontendSlotOptionsFrom,
@@ -117,6 +127,7 @@ interface ChatMsg {
   imageUrl?: string;
   fileName?: string;
   fileSize?: number;
+  images?: WebImageAttachment[];
   streaming?: boolean;
   timestamp?: string;
 }
@@ -255,7 +266,7 @@ function FileBlock({ name, size }: { name: string; size?: number }) {
 }
 
 function ImageBlock({ url }: { url: string }) {
-  return <img src={url} alt="" className="max-w-full sm:max-w-sm rounded-lg border border-gray-200 dark:border-gray-700 shadow-sm" />;
+  return <ImageAttachmentGrid images={[{ id: url, mimeType: 'image/png', url }]} />;
 }
 
 function StatusBadge({ status }: { status: BridgeStatus }) {
@@ -299,7 +310,9 @@ const TypingIndicator = memo(function TypingIndicator() {
 });
 
 const MessageBubble = memo(function MessageBubble({ msg, onAction }: { msg: ChatMsg; onAction: (value: string) => void }) {
+  const { t } = useTranslation();
   const isUser = msg.role === 'user';
+  const hasImages = Boolean(msg.images?.length);
   return (
     <div className={cn('flex gap-2 sm:gap-3 min-w-0', isUser ? 'justify-end' : 'justify-start')}>
       {!isUser && (
@@ -324,9 +337,18 @@ const MessageBubble = memo(function MessageBubble({ msg, onAction }: { msg: Chat
         ) : msg.format === 'file' && msg.fileName ? (
           <FileBlock name={msg.fileName} size={msg.fileSize} />
         ) : isUser ? (
+          msg.content ? (
           <div className="whitespace-pre-wrap">{msg.content}</div>
+          ) : null
         ) : (
-          <RenderMarkdown content={msg.content} />
+          msg.content ? <RenderMarkdown content={msg.content} /> : null
+        )}
+        {hasImages && (
+          <ImageAttachmentGrid
+            images={msg.images || []}
+            className={msg.content || msg.format === 'image' || msg.format === 'file' ? 'mt-3' : ''}
+            downloadLabel={t('chat.downloadImage')}
+          />
         )}
         {msg.streaming && (
           <span className="inline-block w-1.5 h-4 bg-accent/60 rounded-sm ml-0.5 animate-pulse" />
@@ -354,20 +376,44 @@ function ChatComposer({
   sending: boolean;
   placeholder: string;
   commandLabel: string;
-  onSend: (content: string) => boolean | Promise<boolean>;
+  onSend: (content: string, images: WebImageAttachment[]) => boolean | Promise<boolean>;
   onCommandSelect: (cmd: SlashCommand) => void;
 }) {
+  const { t } = useTranslation();
   const [input, setInput] = useState('');
+  const [images, setImages] = useState<WebImageAttachment[]>([]);
+  const [imageError, setImageError] = useState('');
   const [cmdOpen, setCmdOpen] = useState(false);
   const cmdBtnRef = useRef<HTMLButtonElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const hasDraft = Boolean(input.trim()) || images.length > 0;
 
   const submit = useCallback(async () => {
     const content = input.trim();
-    if (!content || !canSend || sending) return;
-    if (await onSend(content)) {
+    if (!hasDraft || !canSend || sending) return;
+    if (await onSend(content, images)) {
       setInput('');
+      setImages([]);
+      setImageError('');
     }
-  }, [canSend, input, onSend, sending]);
+  }, [canSend, hasDraft, images, input, onSend, sending]);
+
+  const handleImagePick = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const inputEl = e.currentTarget;
+    const files = inputEl.files;
+    if (!files?.length) return;
+    const result = await readImageFiles(files, images.length);
+    if (result.attachments.length) {
+      setImages(prev => [...prev, ...result.attachments].slice(0, MAX_IMAGE_ATTACHMENTS));
+    }
+    setImageError(result.errors.map((key) => t(`chat.${key}`)).filter(Boolean).join(' '));
+    inputEl.value = '';
+  }, [images.length, t]);
+
+  const removeImage = useCallback((id: string) => {
+    setImages(prev => prev.filter((image) => image.id !== id));
+    setImageError('');
+  }, []);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -386,7 +432,14 @@ function ChatComposer({
   }, [onCommandSelect]);
 
   return (
-    <div className="relative flex items-end gap-1.5 sm:gap-2">
+    <div className="space-y-2">
+      <ImageAttachmentPreview
+        images={images}
+        onRemove={removeImage}
+        removeLabel={t('chat.removeImage')}
+      />
+      {imageError && <p className="text-xs text-red-600 dark:text-red-400">{imageError}</p>}
+      <div className="relative flex items-end gap-1.5 sm:gap-2">
       <div className="relative">
         <button
           ref={cmdBtnRef}
@@ -410,6 +463,24 @@ function ChatComposer({
         />
       </div>
 
+      <button
+        type="button"
+        onClick={() => imageInputRef.current?.click()}
+        disabled={sending || images.length >= MAX_IMAGE_ATTACHMENTS}
+        className="p-3 min-h-11 min-w-11 rounded-xl text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-white/[0.06] transition-all duration-200 disabled:opacity-40"
+        title={t('chat.attachImages')}
+      >
+        <ImageIcon size={18} />
+      </button>
+      <input
+        ref={imageInputRef}
+        type="file"
+        accept={ALLOWED_IMAGE_MIME_TYPES.join(',')}
+        multiple
+        className="hidden"
+        onChange={handleImagePick}
+      />
+
       <div className="flex-1 relative">
         <input
           value={input}
@@ -424,11 +495,12 @@ function ChatComposer({
       <button
         type="button"
         onClick={submit}
-        disabled={sending || !input.trim()}
+        disabled={sending || !hasDraft}
         className="p-3 min-h-11 min-w-11 rounded-xl bg-accent text-black hover:bg-accent-dim transition-colors disabled:opacity-50 flex items-center justify-center"
       >
         {sending ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
       </button>
+      </div>
     </div>
   );
 }
@@ -452,6 +524,7 @@ function historyToMessages(history: SessionDetail['history'] | undefined): ChatM
     role: h.role as 'user' | 'assistant',
     content: h.content,
     format: 'markdown',
+    images: normalizeImageAttachments((h as any).images, 'history'),
     timestamp: h.timestamp,
   }));
 }
@@ -623,15 +696,40 @@ export default function ChatView() {
     }
 
     if (msg.type === 'reply') {
+      const images = normalizeBridgeImageMessage(msg, 'agent');
       setMessages(prev => {
         const streamIdx = prev.findIndex(m => m.streaming && m.role === 'assistant');
         if (streamIdx >= 0) {
           const updated = [...prev];
-          updated[streamIdx] = { ...updated[streamIdx], content: msg.content, format: (msg as any).format === 'markdown' ? 'markdown' : 'text', streaming: false };
+          updated[streamIdx] = {
+            ...updated[streamIdx],
+            content: msg.content,
+            format: (msg as any).format === 'markdown' ? 'markdown' : 'text',
+            images: images.length ? images : updated[streamIdx].images,
+            streaming: false,
+          };
           return updated;
         }
-        return [...prev, { id: `reply-${Date.now()}`, role: 'assistant', content: msg.content, format: (msg as any).format === 'markdown' ? 'markdown' : 'text' }];
+        return [...prev, {
+          id: `reply-${Date.now()}`,
+          role: 'assistant',
+          content: msg.content,
+          format: (msg as any).format === 'markdown' ? 'markdown' : 'text',
+          images,
+        }];
       });
+      setTyping(false);
+    } else if (msg.type === 'image') {
+      const images = normalizeBridgeImageMessage(msg, 'agent');
+      const content = (msg as any).content || '';
+      if (!images.length && !content) return;
+      setMessages(prev => [...prev, {
+        id: `image-${Date.now()}`,
+        role: 'assistant',
+        content,
+        format: 'image',
+        images,
+      }]);
       setTyping(false);
     } else if (msg.type === 'reply_stream') {
       const stream = msg as Extract<BridgeIncoming, { type: 'reply_stream' }>;
@@ -748,11 +846,12 @@ export default function ChatView() {
   }, [messages, typing]);
 
   // Send message
-  const handleSend = useCallback(async (content: string) => {
-    if (!content.trim() || bridgeStatus !== 'connected') return false;
+  const handleSend = useCallback(async (content: string, images: WebImageAttachment[] = []) => {
+    const hasImages = images.length > 0;
+    if ((!content.trim() && !hasImages) || bridgeStatus !== 'connected') return false;
     setSending(true);
     try {
-      if (content.trim() === '/new') {
+      if (!hasImages && content.trim() === '/new') {
         await handleNewSession();
         return true;
       }
@@ -762,12 +861,12 @@ export default function ChatView() {
 
       const cmdToken = content.split(' ')[0];
       const isKnownCmd = knownCommands.has(cmdToken);
-      if (isKnownCmd && !chatCommands.has(cmdToken)) {
+      if (!hasImages && isKnownCmd && !chatCommands.has(cmdToken)) {
         pendingCmdRef.current = cmdToken;
       } else {
-        setMessages(prev => [...prev, { id: `user-${Date.now()}`, role: 'user', content }]);
+        setMessages(prev => [...prev, { id: `user-${Date.now()}`, role: 'user', content, images }]);
       }
-      bridgeSend(content, targetSession.id);
+      bridgeSend(content, targetSession.id, toBridgeImagePayload(images));
       return true;
     } finally {
       setTimeout(() => setSending(false), 300);

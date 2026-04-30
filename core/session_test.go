@@ -291,6 +291,42 @@ func TestSession_History(t *testing.T) {
 	}
 }
 
+func TestSession_HistoryWithImagesPersists(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sessions.json")
+
+	sm := NewSessionManager(path)
+	s := sm.GetOrCreateActive("user1")
+	s.AddHistoryWithImages("user", "see this", []ImageAttachment{{
+		MimeType: "image/png",
+		Data:     []byte("img"),
+		FileName: "chart.png",
+	}})
+	sm.Save()
+
+	reloaded := NewSessionManager(path)
+	history := reloaded.GetOrCreateActive("user1").GetHistory(0)
+	if len(history) != 1 {
+		t.Fatalf("history len = %d, want 1", len(history))
+	}
+	if len(history[0].Images) != 1 {
+		t.Fatalf("history images len = %d, want 1", len(history[0].Images))
+	}
+	img := history[0].Images[0]
+	if img.MimeType != "image/png" {
+		t.Fatalf("mime_type = %q, want image/png", img.MimeType)
+	}
+	if img.Data != "aW1n" {
+		t.Fatalf("data = %q, want base64 image bytes", img.Data)
+	}
+	if img.FileName != "chart.png" {
+		t.Fatalf("file_name = %q, want chart.png", img.FileName)
+	}
+	if img.Size != 3 {
+		t.Fatalf("size = %d, want 3", img.Size)
+	}
+}
+
 func TestSession_ConcurrentHistory(t *testing.T) {
 	s := &Session{}
 	var wg sync.WaitGroup

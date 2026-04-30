@@ -2220,7 +2220,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 
 	e.i18n.DetectAndSet(msg.Content)
 	wasFirstMessage := len(session.GetHistory(1)) == 0
-	session.AddHistory("user", msg.Content)
+	session.AddHistoryWithImages("user", msg.Content, msg.Images)
 	if wasFirstMessage {
 		e.ensureSessionAlias(session, sessions, msg.SessionKey, msg.Content)
 	}
@@ -3270,7 +3270,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				sp = newStreamPreview(e.streamPreview, queued.platform, queued.replyCtx, e.ctx, queuedRenderer)
 				cp = newCompactProgressWriter(e.ctx, queued.platform, queued.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), queuedRenderer)
 
-				session.AddHistory("user", queued.content)
+				session.AddHistoryWithImages("user", queued.content, queued.images)
 
 				if idleTimer != nil {
 					if !idleTimer.Stop() {
@@ -3404,7 +3404,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 
 		drainEvents(state.agentSession.Events())
 
-		session.AddHistory("user", queued.content)
+		session.AddHistoryWithImages("user", queued.content, queued.images)
 
 		sendDone := make(chan error, 1)
 		go func() {

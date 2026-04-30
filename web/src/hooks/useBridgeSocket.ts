@@ -1,13 +1,15 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import api from '@/api/client';
 import { DEFAULT_WEB_BRIDGE_PLATFORM, WEB_BRIDGE_USER_ID, WEB_BRIDGE_USER_NAME, normalizeWebBridgePlatform } from '@/lib/webPlatform';
+import type { BridgeImagePayload } from '@/lib/attachments';
 
 type BridgeScoped = { session_key: string; session_id?: string };
 type BridgeReplyScoped = BridgeScoped & { reply_ctx: string };
 
 export type BridgeIncoming =
   | { type: 'register_ack'; ok: boolean; error?: string }
-  | (BridgeReplyScoped & { type: 'reply'; content: string; format?: string })
+  | (BridgeReplyScoped & { type: 'reply'; content: string; format?: string; images?: unknown[] })
+  | (BridgeScoped & { type: 'image'; content?: string; image?: unknown; images?: unknown[]; reply_ctx?: string })
   | (BridgeReplyScoped & { type: 'reply_stream'; delta: string; full_text: string; preview_handle?: string; done: boolean })
   | (BridgeReplyScoped & { type: 'card'; card: any })
   | (BridgeReplyScoped & { type: 'buttons'; content: string; buttons: { text: string; data: string }[][] })
@@ -59,7 +61,7 @@ export function useBridgeSocket({ bridgeCfg, platformName = DEFAULT_WEB_BRIDGE_P
     }
   }, []);
 
-  const sendMessage = useCallback((content: string, overrideSessionId?: string) => {
+  const sendMessage = useCallback((content: string, overrideSessionId?: string, images?: BridgeImagePayload[]) => {
     const targetSessionId = overrideSessionId || sessionId;
     send({
       type: 'message',
@@ -73,6 +75,7 @@ export function useBridgeSocket({ bridgeCfg, platformName = DEFAULT_WEB_BRIDGE_P
       content,
       reply_ctx: sessionKey,
       project: projectName || '',
+      images: images && images.length > 0 ? images : undefined,
     });
   }, [send, sessionKey, sessionId, transportSessionKey, visibleRoute, projectName]);
 
@@ -125,7 +128,7 @@ export function useBridgeSocket({ bridgeCfg, platformName = DEFAULT_WEB_BRIDGE_P
           transport_session_key: transportSessionKey,
           route: visibleRoute,
           project: projectName || undefined,
-          capabilities: ['text', 'card', 'buttons', 'typing', 'update_message', 'preview', 'reconstruct_reply'],
+          capabilities: ['text', 'image', 'card', 'buttons', 'typing', 'update_message', 'preview', 'reconstruct_reply'],
           metadata: {
             version: '1.0.0',
             description: 'Web Admin Dashboard',

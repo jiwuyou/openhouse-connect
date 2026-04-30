@@ -1,9 +1,18 @@
 import api from './client';
+import type { BridgeImagePayload } from '@/lib/attachments';
 
 export interface LastMessage {
   role: string;
   content: string;
   timestamp: string;
+  images?: unknown[];
+}
+
+export interface SessionHistoryEntry {
+  role: string;
+  content: string;
+  timestamp: string;
+  images?: unknown[];
 }
 
 export interface Session {
@@ -26,7 +35,7 @@ export interface Session {
 
 export interface SessionDetail extends Session {
   agent_session_id: string;
-  history: { role: string; content: string; timestamp: string }[];
+  history: SessionHistoryEntry[];
 }
 
 export const listSessions = (project: string) =>
@@ -40,5 +49,5 @@ export const updateSession = (project: string, id: string, body: { name: string 
 export const deleteSession = (project: string, id: string) => api.delete(`/projects/${project}/sessions/${id}`);
 export const switchSession = (project: string, body: { session_key: string; session_id: string }) =>
   api.post(`/projects/${project}/sessions/switch`, body);
-export const sendMessage = (project: string, body: { session_key: string; session_id?: string; message: string }) =>
+export const sendMessage = (project: string, body: { session_key: string; session_id?: string; message: string; images?: BridgeImagePayload[] }) =>
   api.post(`/projects/${project}/send`, body);

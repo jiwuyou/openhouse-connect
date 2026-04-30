@@ -630,7 +630,11 @@ func TestMgmt_SessionDetail(t *testing.T) {
 	_, ts, e := testManagementServer(t, "tok")
 
 	s := e.sessions.GetOrCreateActive("user1")
-	s.AddHistory("user", "hello")
+	s.AddHistoryWithImages("user", "hello", []ImageAttachment{{
+		MimeType: "image/jpeg",
+		Data:     []byte("photo"),
+		FileName: "photo.jpg",
+	}})
 	s.AddHistory("assistant", "hi there")
 
 	r := mgmtGet(t, ts.URL+"/api/v1/projects/test-project/sessions/"+s.ID, "tok")
@@ -646,6 +650,26 @@ func TestMgmt_SessionDetail(t *testing.T) {
 	}
 	if len(data.History) != 2 {
 		t.Fatalf("expected 2 history entries, got %d", len(data.History))
+	}
+	images, ok := data.History[0]["images"].([]any)
+	if !ok || len(images) != 1 {
+		t.Fatalf("history[0].images = %#v, want one image", data.History[0]["images"])
+	}
+	image, ok := images[0].(map[string]any)
+	if !ok {
+		t.Fatalf("history[0].images[0] = %#v, want object", images[0])
+	}
+	if image["mime_type"] != "image/jpeg" {
+		t.Fatalf("mime_type = %#v, want image/jpeg", image["mime_type"])
+	}
+	if image["data"] != "cGhvdG8=" {
+		t.Fatalf("data = %#v, want base64 image", image["data"])
+	}
+	if image["file_name"] != "photo.jpg" {
+		t.Fatalf("file_name = %#v, want photo.jpg", image["file_name"])
+	}
+	if image["size"] != float64(5) {
+		t.Fatalf("size = %#v, want 5", image["size"])
 	}
 }
 
@@ -730,6 +754,63 @@ func TestMgmt_SendAcceptsSessionID(t *testing.T) {
 	}
 	if sent := secondPlatform.getSent(); len(sent) != 1 || sent[0] != "hello from api" {
 		t.Fatalf("second session sent = %#v, want one API message", sent)
+	}
+}
+
+func TestMgmt_SendAcceptsImages(t *testing.T) {
+	_, ts, e := testManagementServer(t, "tok")
+
+	first := e.sessions.NewSession("webnew:web-admin:proj", "first")
+	second := e.sessions.NewSession("webnew:web-admin:proj", "second")
+	firstPlatform := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "webnew"}}
+	secondPlatform := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "webnew"}}
+	e.platforms = []Platform{firstPlatform, secondPlatform}
+	e.interactiveMu.Lock()
+	e.interactiveStates["webnew:web-admin:proj::"+first.ID] = &interactiveState{
+		platform: firstPlatform,
+		replyCtx: "ctx-first",
+	}
+	e.interactiveStates["webnew:web-admin:proj::"+second.ID] = &interactiveState{
+		platform: secondPlatform,
+		replyCtx: "ctx-second",
+	}
+	e.interactiveMu.Unlock()
+
+	r := mgmtPost(t, ts.URL+"/api/v1/projects/test-project/send", "tok", map[string]any{
+		"session_id": second.ID,
+		"images": []map[string]any{{
+			"mime_type": "image/png",
+			"data":      "aW1n",
+			"file_name": "chart.png",
+		}},
+	})
+	if !r.OK {
+		t.Fatalf("send failed: %s", r.Error)
+	}
+	var data struct {
+		SessionKey string `json:"session_key"`
+		SessionID  string `json:"session_id"`
+	}
+	if err := json.Unmarshal(r.Data, &data); err != nil {
+		t.Fatalf("unmarshal send response: %v", err)
+	}
+	if data.SessionKey != "webnew:web-admin:proj" {
+		t.Fatalf("session_key = %q, want webnew:web-admin:proj", data.SessionKey)
+	}
+	if data.SessionID != second.ID {
+		t.Fatalf("session_id = %q, want %q", data.SessionID, second.ID)
+	}
+	if len(firstPlatform.images) != 0 {
+		t.Fatalf("first images = %#v, want none", firstPlatform.images)
+	}
+	if len(secondPlatform.images) != 1 {
+		t.Fatalf("second images len = %d, want 1", len(secondPlatform.images))
+	}
+	if img := secondPlatform.images[0]; img.MimeType != "image/png" || string(img.Data) != "img" || img.FileName != "chart.png" {
+		t.Fatalf("second image = %#v, want decoded chart.png", img)
+	}
+	if sent := secondPlatform.getSent(); len(sent) != 0 {
+		t.Fatalf("second text sent = %#v, want none for pure image", sent)
 	}
 }
 

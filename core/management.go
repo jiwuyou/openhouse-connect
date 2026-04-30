@@ -1281,11 +1281,7 @@ func (m *ManagementServer) handleProjectSessionDetail(w http.ResponseWriter, r *
 
 		histJSON := make([]map[string]any, len(hist))
 		for i, h := range hist {
-			histJSON[i] = map[string]any{
-				"role":      h.Role,
-				"content":   h.Content,
-				"timestamp": h.Timestamp,
-			}
+			histJSON[i] = historyEntryMap(h, true)
 		}
 
 		idToKey, activeIDs := e.sessions.SessionKeyMap()
@@ -1395,16 +1391,22 @@ func (m *ManagementServer) handleProjectSend(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var body struct {
-		SessionKey string `json:"session_key"`
-		SessionID  string `json:"session_id,omitempty"`
-		Message    string `json:"message"`
+		SessionKey string            `json:"session_key"`
+		SessionID  string            `json:"session_id,omitempty"`
+		Message    string            `json:"message"`
+		Images     []bridgeImageData `json:"images,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	if body.Message == "" {
-		mgmtError(w, http.StatusBadRequest, "message is required")
+	images, err := bridgeImagesToAttachments(body.Images)
+	if err != nil {
+		mgmtError(w, http.StatusBadRequest, "invalid images: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(body.Message) == "" && len(images) == 0 {
+		mgmtError(w, http.StatusBadRequest, "message or attachment is required")
 		return
 	}
 
@@ -1425,11 +1427,10 @@ func (m *ManagementServer) handleProjectSend(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	var err error
 	if sessionID != "" {
-		err = e.SendToSessionID(sessionKey, sessionID, body.Message)
+		err = e.SendToSessionWithSessionIDAndAttachments(sessionKey, sessionID, body.Message, images, nil)
 	} else {
-		err = e.SendToSession(sessionKey, body.Message)
+		err = e.SendToSessionWithAttachments(sessionKey, body.Message, images, nil)
 	}
 	if err != nil {
 		mgmtError(w, http.StatusInternalServerError, err.Error())
@@ -1460,34 +1461,7 @@ func (e *Engine) SendToSessionID(sessionKey, sessionID, message string) error {
 	if message == "" {
 		return fmt.Errorf("message is required")
 	}
-
-	e.interactiveMu.Lock()
-	runtimeKey := interactiveKeyWithSessionID(e.interactiveKeyForSessionKey(sessionKey), sessionID)
-	state := e.interactiveStates[runtimeKey]
-	if state == nil {
-		plainRuntimeKey := interactiveKeyWithSessionID(sessionKey, sessionID)
-		if plainRuntimeKey != runtimeKey {
-			state = e.interactiveStates[plainRuntimeKey]
-		}
-	}
-	e.interactiveMu.Unlock()
-
-	if state == nil {
-		return fmt.Errorf("no active session found (key=%q session_id=%q)", sessionKey, sessionID)
-	}
-
-	state.mu.Lock()
-	p := state.platform
-	replyCtx := state.replyCtx
-	state.mu.Unlock()
-
-	if p == nil {
-		return fmt.Errorf("no active session found (key=%q session_id=%q)", sessionKey, sessionID)
-	}
-	if err := e.waitOutgoing(p); err != nil {
-		return err
-	}
-	return p.Send(e.ctx, replyCtx, message)
+	return e.SendToSessionWithSessionIDAndAttachments(sessionKey, sessionID, message, nil, nil)
 }
 
 // ── Provider endpoints ────────────────────────────────────────

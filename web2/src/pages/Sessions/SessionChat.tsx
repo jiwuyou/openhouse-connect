@@ -8,6 +8,7 @@ import {
 import { Badge, Button } from '@/components/ui';
 import { getSession, type SessionDetail } from '@/api/sessions';
 import { useBridgeSocket, fetchBridgeConfig, type BridgeConfig, type BridgeIncoming, type BridgeStatus } from '@/hooks/useBridgeSocket';
+import { ImageAttachmentGrid, ImageAttachmentPreview } from '@/components/ImageAttachments';
 import {
   DEFAULT_WEB_BRIDGE_PLATFORM,
   getWebBridgeTransportPlatform,
@@ -20,6 +21,15 @@ import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { cn } from '@/lib/utils';
+import {
+  ALLOWED_IMAGE_MIME_TYPES,
+  MAX_IMAGE_ATTACHMENTS,
+  normalizeBridgeImageMessage,
+  normalizeImageAttachments,
+  readImageFiles,
+  toBridgeImagePayload,
+  type WebImageAttachment,
+} from '@/lib/attachments';
 
 // ── Markdown renderers ───────────────────────────────────────
 
@@ -104,6 +114,7 @@ interface ChatMsg {
   imageUrl?: string;
   fileName?: string;
   fileSize?: number;
+  images?: WebImageAttachment[];
   streaming?: boolean;
   timestamp?: string;
 }
@@ -217,7 +228,7 @@ function FileBlock({ name, size }: { name: string; size?: number }) {
 }
 
 function ImageBlock({ url }: { url: string }) {
-  return <img src={url} alt="" className="max-w-full sm:max-w-sm rounded-lg border border-gray-200 dark:border-gray-700 shadow-sm" />;
+  return <ImageAttachmentGrid images={[{ id: url, mimeType: 'image/png', url }]} />;
 }
 
 // ── Connection status badge ──────────────────────────────────
@@ -263,7 +274,9 @@ const TypingIndicator = memo(function TypingIndicator() {
 });
 
 const MessageBubble = memo(function MessageBubble({ msg, onAction }: { msg: ChatMsg; onAction: (value: string) => void }) {
+  const { t } = useTranslation();
   const isUser = msg.role === 'user';
+  const hasImages = Boolean(msg.images?.length);
   return (
     <div className={cn('flex gap-2 sm:gap-3 min-w-0', isUser ? 'justify-end' : 'justify-start')}>
       {!isUser && (
@@ -288,9 +301,16 @@ const MessageBubble = memo(function MessageBubble({ msg, onAction }: { msg: Chat
         ) : msg.format === 'file' && msg.fileName ? (
           <FileBlock name={msg.fileName} size={msg.fileSize} />
         ) : isUser ? (
-          <div className="whitespace-pre-wrap">{msg.content}</div>
+          msg.content ? <div className="whitespace-pre-wrap">{msg.content}</div> : null
         ) : (
-          <RenderMarkdown content={msg.content} />
+          msg.content ? <RenderMarkdown content={msg.content} /> : null
+        )}
+        {hasImages && (
+          <ImageAttachmentGrid
+            images={msg.images || []}
+            className={msg.content || msg.format === 'image' || msg.format === 'file' ? 'mt-3' : ''}
+            downloadLabel={t('chat.downloadImage')}
+          />
         )}
         {msg.streaming && (
           <span className="inline-block w-1.5 h-4 bg-accent/60 rounded-sm ml-0.5 animate-pulse" />
@@ -315,17 +335,41 @@ function SessionComposer({
   canSend: boolean;
   sending: boolean;
   placeholder: string;
-  onSend: (content: string) => boolean;
+  onSend: (content: string, images: WebImageAttachment[]) => boolean;
 }) {
+  const { t } = useTranslation();
   const [input, setInput] = useState('');
+  const [images, setImages] = useState<WebImageAttachment[]>([]);
+  const [imageError, setImageError] = useState('');
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const hasDraft = Boolean(input.trim()) || images.length > 0;
 
   const submit = useCallback(() => {
     const content = input.trim();
-    if (!content || !canSend || sending) return;
-    if (onSend(content)) {
+    if (!hasDraft || !canSend || sending) return;
+    if (onSend(content, images)) {
       setInput('');
+      setImages([]);
+      setImageError('');
     }
-  }, [canSend, input, onSend, sending]);
+  }, [canSend, hasDraft, images, input, onSend, sending]);
+
+  const handleImagePick = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const inputEl = e.currentTarget;
+    const files = inputEl.files;
+    if (!files?.length) return;
+    const result = await readImageFiles(files, images.length);
+    if (result.attachments.length) {
+      setImages(prev => [...prev, ...result.attachments].slice(0, MAX_IMAGE_ATTACHMENTS));
+    }
+    setImageError(result.errors.map((key) => t(`chat.${key}`)).filter(Boolean).join(' '));
+    inputEl.value = '';
+  }, [images.length, t]);
+
+  const removeImage = useCallback((imageId: string) => {
+    setImages(prev => prev.filter((image) => image.id !== imageId));
+    setImageError('');
+  }, []);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -335,7 +379,31 @@ function SessionComposer({
   };
 
   return (
-    <div className="flex gap-1.5 sm:gap-3">
+    <div className="space-y-2">
+      <ImageAttachmentPreview
+        images={images}
+        onRemove={removeImage}
+        removeLabel={t('chat.removeImage')}
+      />
+      {imageError && <p className="text-xs text-red-600 dark:text-red-400">{imageError}</p>}
+      <div className="flex gap-1.5 sm:gap-3">
+      <button
+        type="button"
+        onClick={() => imageInputRef.current?.click()}
+        disabled={sending || images.length >= MAX_IMAGE_ATTACHMENTS}
+        className="p-3 min-h-11 min-w-11 rounded-xl text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-white/[0.06] transition-all duration-200 disabled:opacity-40"
+        title={t('chat.attachImages')}
+      >
+        <ImageIcon size={18} />
+      </button>
+      <input
+        ref={imageInputRef}
+        type="file"
+        accept={ALLOWED_IMAGE_MIME_TYPES.join(',')}
+        multiple
+        className="hidden"
+        onChange={handleImagePick}
+      />
       <input
         value={input}
         onChange={(e) => setInput(e.target.value)}
@@ -346,7 +414,7 @@ function SessionComposer({
       />
       <button
         onClick={submit}
-        disabled={sending || !input.trim()}
+        disabled={sending || !hasDraft}
         className="p-3 min-h-11 min-w-11 rounded-xl bg-accent text-black hover:bg-accent-dim transition-colors disabled:opacity-50 flex items-center justify-center gap-2 shrink-0"
       >
         {sending ? (
@@ -355,6 +423,7 @@ function SessionComposer({
           <Send size={18} />
         )}
       </button>
+      </div>
     </div>
   );
 }
@@ -402,6 +471,7 @@ export default function SessionChat() {
           role: h.role as 'user' | 'assistant',
           content: h.content,
           format: 'markdown',
+          images: normalizeImageAttachments((h as any).images, 'history'),
           timestamp: h.timestamp,
         })));
       }
@@ -424,11 +494,18 @@ export default function SessionChat() {
     }
 
     if (msg.type === 'reply') {
+      const images = normalizeBridgeImageMessage(msg, 'agent');
       setMessages(prev => {
         const streamIdx = prev.findIndex(m => m.streaming && m.role === 'assistant');
         if (streamIdx >= 0) {
           const updated = [...prev];
-          updated[streamIdx] = { ...updated[streamIdx], content: msg.content, format: (msg as any).format === 'markdown' ? 'markdown' : 'text', streaming: false };
+          updated[streamIdx] = {
+            ...updated[streamIdx],
+            content: msg.content,
+            format: (msg as any).format === 'markdown' ? 'markdown' : 'text',
+            images: images.length ? images : updated[streamIdx].images,
+            streaming: false,
+          };
           return updated;
         }
         return [...prev, {
@@ -436,8 +513,21 @@ export default function SessionChat() {
           role: 'assistant',
           content: msg.content,
           format: (msg as any).format === 'markdown' ? 'markdown' : 'text',
+          images,
         }];
       });
+      setTyping(false);
+    } else if (msg.type === 'image') {
+      const images = normalizeBridgeImageMessage(msg, 'agent');
+      const content = (msg as any).content || '';
+      if (!images.length && !content) return;
+      setMessages(prev => [...prev, {
+        id: `image-${Date.now()}`,
+        role: 'assistant',
+        content,
+        format: 'image',
+        images,
+      }]);
       setTyping(false);
     } else if (msg.type === 'reply_stream') {
       const stream = msg as Extract<BridgeIncoming, { type: 'reply_stream' }>;
@@ -536,15 +626,16 @@ export default function SessionChat() {
     messagesEnd.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, typing]);
 
-  const handleSend = useCallback((content: string) => {
-    if (!content.trim() || bridgeStatus !== 'connected') return false;
+  const handleSend = useCallback((content: string, images: WebImageAttachment[] = []) => {
+    if ((!content.trim() && images.length === 0) || bridgeStatus !== 'connected') return false;
     setSending(true);
     setMessages(prev => [...prev, {
       id: `user-${Date.now()}`,
       role: 'user',
       content,
+      images,
     }]);
-    bridgeSend(content, sessionId);
+    bridgeSend(content, sessionId, toBridgeImagePayload(images));
     setTimeout(() => setSending(false), 300);
     return true;
   }, [bridgeStatus, bridgeSend, sessionId]);

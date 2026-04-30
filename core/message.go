@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"os"
@@ -8,6 +9,18 @@ import (
 	"strings"
 	"time"
 )
+
+const (
+	maxImageAttachments     = 4
+	maxImageAttachmentBytes = 5 * 1024 * 1024
+)
+
+var allowedImageMimeTypes = map[string]struct{}{
+	"image/png":  {},
+	"image/jpeg": {},
+	"image/webp": {},
+	"image/gif":  {},
+}
 
 // MergeEnv returns base env with entries from extra overriding same-key entries.
 // This prevents duplicate keys (e.g. two PATH entries) which cause the override
@@ -69,6 +82,81 @@ type ImageAttachment struct {
 	MimeType string // e.g. "image/png", "image/jpeg"
 	Data     []byte // raw image bytes
 	FileName string // original filename (optional)
+}
+
+func validateImageAttachmentCount(count int) error {
+	if count > maxImageAttachments {
+		return fmt.Errorf("too many images: %d > %d", count, maxImageAttachments)
+	}
+	return nil
+}
+
+func imageAttachmentFromBase64(mimeType, data, fileName string) (ImageAttachment, error) {
+	mimeType = strings.ToLower(strings.TrimSpace(mimeType))
+	if _, ok := allowedImageMimeTypes[mimeType]; !ok {
+		return ImageAttachment{}, fmt.Errorf("unsupported image mime type %q", mimeType)
+	}
+
+	data = stripDataURLPrefix(strings.TrimSpace(data))
+	if data == "" {
+		return ImageAttachment{}, fmt.Errorf("image data is required")
+	}
+	if len(data) > base64.StdEncoding.EncodedLen(maxImageAttachmentBytes) {
+		return ImageAttachment{}, fmt.Errorf("image is too large: encoded payload exceeds %d bytes", maxImageAttachmentBytes)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return ImageAttachment{}, fmt.Errorf("invalid image base64: %w", err)
+	}
+	if len(decoded) > maxImageAttachmentBytes {
+		return ImageAttachment{}, fmt.Errorf("image is too large: %d > %d bytes", len(decoded), maxImageAttachmentBytes)
+	}
+	return ImageAttachment{
+		MimeType: mimeType,
+		Data:     decoded,
+		FileName: strings.TrimSpace(fileName),
+	}, nil
+}
+
+func stripDataURLPrefix(data string) string {
+	if !strings.HasPrefix(data, "data:") {
+		return data
+	}
+	if idx := strings.IndexByte(data, ','); idx >= 0 {
+		return data[idx+1:]
+	}
+	return data
+}
+
+// HistoryImageAttachment is the JSON-safe representation of an image stored in
+// conversation history. Data is base64 text, never raw bytes.
+type HistoryImageAttachment struct {
+	MimeType string `json:"mime_type,omitempty"`
+	Data     string `json:"data,omitempty"`
+	FileName string `json:"file_name,omitempty"`
+	Size     int    `json:"size,omitempty"`
+}
+
+// HistoryImagesFromAttachments converts runtime image bytes into a stable,
+// JSON-safe history representation.
+func HistoryImagesFromAttachments(images []ImageAttachment) []HistoryImageAttachment {
+	if len(images) == 0 {
+		return nil
+	}
+	out := make([]HistoryImageAttachment, 0, len(images))
+	for _, img := range images {
+		size := len(img.Data)
+		entry := HistoryImageAttachment{
+			MimeType: strings.TrimSpace(img.MimeType),
+			FileName: strings.TrimSpace(img.FileName),
+			Size:     size,
+		}
+		if size > 0 {
+			entry.Data = base64.StdEncoding.EncodeToString(img.Data)
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // FileAttachment represents a file (PDF, doc, spreadsheet, etc.) sent by the user.
@@ -206,9 +294,24 @@ type Event struct {
 
 // HistoryEntry is one turn in a conversation.
 type HistoryEntry struct {
-	Role      string    `json:"role"` // "user" or "assistant"
-	Content   string    `json:"content"`
-	Timestamp time.Time `json:"timestamp"`
+	Role      string                   `json:"role"` // "user" or "assistant"
+	Content   string                   `json:"content"`
+	Images    []HistoryImageAttachment `json:"images,omitempty"`
+	Timestamp time.Time                `json:"timestamp"`
+}
+
+func historyEntryMap(h HistoryEntry, includeTimestamp bool) map[string]any {
+	entry := map[string]any{
+		"role":    h.Role,
+		"content": h.Content,
+	}
+	if len(h.Images) > 0 {
+		entry["images"] = h.Images
+	}
+	if includeTimestamp {
+		entry["timestamp"] = h.Timestamp
+	}
+	return entry
 }
 
 // AgentSessionInfo describes one session as reported by the agent backend.

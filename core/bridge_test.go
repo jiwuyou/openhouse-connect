@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -333,6 +334,76 @@ func TestBridge_MessageRouting(t *testing.T) {
 	}
 	if received.Images[0].FileName != "test.png" {
 		t.Fatalf("image filename = %q, want %q", received.Images[0].FileName, "test.png")
+	}
+}
+
+func TestBridge_MessageRejectsInvalidImages(t *testing.T) {
+	tests := []struct {
+		name   string
+		images []map[string]any
+	}{
+		{
+			name: "too many",
+			images: []map[string]any{
+				{"mime_type": "image/png", "data": base64.StdEncoding.EncodeToString([]byte("1"))},
+				{"mime_type": "image/png", "data": base64.StdEncoding.EncodeToString([]byte("2"))},
+				{"mime_type": "image/png", "data": base64.StdEncoding.EncodeToString([]byte("3"))},
+				{"mime_type": "image/png", "data": base64.StdEncoding.EncodeToString([]byte("4"))},
+				{"mime_type": "image/png", "data": base64.StdEncoding.EncodeToString([]byte("5"))},
+			},
+		},
+		{
+			name: "unsupported mime",
+			images: []map[string]any{
+				{"mime_type": "image/svg+xml", "data": base64.StdEncoding.EncodeToString([]byte("svg"))},
+			},
+		},
+		{
+			name: "too large",
+			images: []map[string]any{
+				{"mime_type": "image/png", "data": strings.Repeat("a", base64.StdEncoding.EncodedLen(maxImageAttachmentBytes)+4)},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bs, wsURL := startTestBridge(t, "")
+			received := make(chan *Message, 1)
+
+			bp := bs.NewPlatform("test-proj")
+			e := NewEngine("test-proj", &stubAgent{}, []Platform{bp}, "", LangEnglish)
+			bs.RegisterEngine("test-proj", e, bp)
+			bp.handler = func(p Platform, msg *Message) {
+				received <- msg
+			}
+
+			conn := dialWS(t, wsURL, nil)
+			register(t, conn, "mychat", []string{"text"})
+
+			mustWriteJSON(t, conn, map[string]any{
+				"type":        "message",
+				"msg_id":      "m1",
+				"session_key": "mychat:user1:user1",
+				"user_id":     "user1",
+				"content":     "hello bridge",
+				"reply_ctx":   "conv-1",
+				"images":      tt.images,
+			})
+
+			errMsg := readMsg(t, conn)
+			if errMsg["type"] != "error" {
+				t.Fatalf("type = %#v, want error", errMsg["type"])
+			}
+			if errMsg["code"] != "invalid_images" {
+				t.Fatalf("code = %#v, want invalid_images", errMsg["code"])
+			}
+			select {
+			case got := <-received:
+				t.Fatalf("handler received invalid message: %#v", got)
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
 	}
 }
 
@@ -685,6 +756,73 @@ func TestBridge_CardFallback(t *testing.T) {
 	content, _ := reply["content"].(string)
 	if !strings.Contains(content, "hello") {
 		t.Fatalf("fallback should contain 'hello', got %q", content)
+	}
+}
+
+func TestBridge_SendImage(t *testing.T) {
+	bs, wsURL := startTestBridge(t, "")
+
+	bp := bs.NewPlatform("test-proj")
+	e := NewEngine("test-proj", &stubAgent{}, []Platform{bp}, "", LangEnglish)
+	bs.RegisterEngine("test-proj", e, bp)
+	errCh := make(chan error, 1)
+	bp.handler = func(p Platform, msg *Message) {
+		sender, ok := p.(ImageSender)
+		if !ok {
+			errCh <- fmt.Errorf("BridgePlatform should implement ImageSender")
+			return
+		}
+		errCh <- sender.SendImage(context.TODO(), msg.ReplyCtx, ImageAttachment{
+			MimeType: "image/png",
+			Data:     []byte("img"),
+			FileName: "chart.png",
+		})
+	}
+
+	conn := dialWS(t, wsURL, nil)
+	register(t, conn, "withimages", []string{"text", "image"})
+
+	mustWriteJSON(t, conn, map[string]any{
+		"type":        "message",
+		"msg_id":      "m1",
+		"session_key": "withimages:u1:u1",
+		"session_id":  "s1",
+		"user_id":     "u1",
+		"content":     "send image",
+		"reply_ctx":   "c1",
+	})
+
+	reply := readMsg(t, conn)
+	if err := <-errCh; err != nil {
+		t.Fatalf("SendImage: %v", err)
+	}
+	if reply["type"] != "image" {
+		t.Fatalf("type = %#v, want image", reply["type"])
+	}
+	if reply["session_key"] != "withimages:u1:u1" {
+		t.Fatalf("session_key = %#v", reply["session_key"])
+	}
+	if reply["session_id"] != "s1" {
+		t.Fatalf("session_id = %#v", reply["session_id"])
+	}
+	if reply["reply_ctx"] != "c1" {
+		t.Fatalf("reply_ctx = %#v", reply["reply_ctx"])
+	}
+	image, ok := reply["image"].(map[string]any)
+	if !ok {
+		t.Fatalf("image = %#v, want object", reply["image"])
+	}
+	if image["mime_type"] != "image/png" {
+		t.Fatalf("mime_type = %#v, want image/png", image["mime_type"])
+	}
+	if image["data"] != "aW1n" {
+		t.Fatalf("data = %#v, want base64 image", image["data"])
+	}
+	if image["file_name"] != "chart.png" {
+		t.Fatalf("file_name = %#v, want chart.png", image["file_name"])
+	}
+	if image["size"] != float64(3) {
+		t.Fatalf("size = %#v, want 3", image["size"])
 	}
 }
 
@@ -1274,6 +1412,56 @@ func TestBridge_SessionCreateAndDetail(t *testing.T) {
 	}
 	if detail.CreatedAt == "" || detail.UpdatedAt == "" {
 		t.Fatalf("detail timestamps missing: created_at=%q updated_at=%q", detail.CreatedAt, detail.UpdatedAt)
+	}
+}
+
+func TestBridge_SessionDetailIncludesImages(t *testing.T) {
+	bs, baseURL := startTestBridgeWithREST(t, "tok")
+
+	bs.enginesMu.RLock()
+	ref := bs.engines["test-proj"]
+	bs.enginesMu.RUnlock()
+	if ref == nil {
+		t.Fatal("test engine not registered")
+	}
+
+	s := ref.engine.sessions.NewSession("test:u1:u1", "images")
+	s.AddHistoryWithImages("user", "attached", []ImageAttachment{{
+		MimeType: "image/webp",
+		Data:     []byte("webp"),
+		FileName: "mock.webp",
+	}})
+
+	r := bridgeGet(t, baseURL+"/bridge/sessions/"+s.ID+"?session_key=test:u1:u1", "tok")
+	if !r.OK {
+		t.Fatalf("get detail failed: %s", r.Error)
+	}
+	var detail struct {
+		History []map[string]any `json:"history"`
+	}
+	mustUnmarshalJSON(t, r.Data, &detail)
+	if len(detail.History) != 1 {
+		t.Fatalf("history len = %d, want 1", len(detail.History))
+	}
+	images, ok := detail.History[0]["images"].([]any)
+	if !ok || len(images) != 1 {
+		t.Fatalf("history[0].images = %#v, want one image", detail.History[0]["images"])
+	}
+	image, ok := images[0].(map[string]any)
+	if !ok {
+		t.Fatalf("history[0].images[0] = %#v, want object", images[0])
+	}
+	if image["mime_type"] != "image/webp" {
+		t.Fatalf("mime_type = %#v, want image/webp", image["mime_type"])
+	}
+	if image["data"] != "d2VicA==" {
+		t.Fatalf("data = %#v, want base64 image", image["data"])
+	}
+	if image["file_name"] != "mock.webp" {
+		t.Fatalf("file_name = %#v, want mock.webp", image["file_name"])
+	}
+	if image["size"] != float64(4) {
+		t.Fatalf("size = %#v, want 4", image["size"])
 	}
 }
 

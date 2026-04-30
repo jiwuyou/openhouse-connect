@@ -65,11 +65,16 @@ func (s *Session) unlock(update bool) {
 }
 
 func (s *Session) AddHistory(role, content string) {
+	s.AddHistoryWithImages(role, content, nil)
+}
+
+func (s *Session) AddHistoryWithImages(role, content string, images []ImageAttachment) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.History = append(s.History, HistoryEntry{
 		Role:      role,
 		Content:   content,
+		Images:    HistoryImagesFromAttachments(images),
 		Timestamp: time.Now(),
 	})
 }
