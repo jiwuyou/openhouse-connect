@@ -273,3 +273,37 @@ func TestHostDefaultIsAllInterfaces(t *testing.T) {
 		t.Fatalf("opts.Host=%q want empty (listen all)", s.opts.Host)
 	}
 }
+
+func TestStaticUIIsServedWithoutToken(t *testing.T) {
+	tmp := t.TempDir()
+	s, err := NewServer(Options{
+		Host:    "",
+		Port:    9831,
+		Token:   "secret",
+		DataDir: tmp,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	ts := httptest.NewServer(s.handler)
+	t.Cleanup(ts.Close)
+
+	res, err := ts.Client().Get(ts.URL + "/styles.css")
+	if err != nil {
+		t.Fatalf("GET styles.css: %v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(res.Body)
+		t.Fatalf("GET styles.css status=%d body=%s", res.StatusCode, string(b))
+	}
+
+	apiRes, err := ts.Client().Get(ts.URL + "/api/projects/proj/sessions")
+	if err != nil {
+		t.Fatalf("GET sessions: %v", err)
+	}
+	defer apiRes.Body.Close()
+	if apiRes.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("GET sessions status=%d want 401", apiRes.StatusCode)
+	}
+}

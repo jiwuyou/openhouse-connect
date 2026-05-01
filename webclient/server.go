@@ -42,11 +42,11 @@ type Server struct {
 	events  *broker.Hub
 	handler http.Handler
 
-	mu              sync.RWMutex
-	started         bool
-	httpServer      *http.Server
-	listener        net.Listener
-	projectHandlers map[string]core.MessageHandler
+	mu               sync.RWMutex
+	started          bool
+	httpServer       *http.Server
+	listener         net.Listener
+	projectHandlers  map[string]core.MessageHandler
 	projectPlatforms map[string]*platform
 
 	// static serves the webclient UI when configured or embedded.
@@ -156,8 +156,9 @@ func (s *Server) newMux() http.Handler {
 	mux.HandleFunc("GET /api/projects/{project}/sessions/{session}/events", s.wrap(s.handleEvents))
 	mux.HandleFunc("GET /attachments/{id}", s.wrap(s.handleGetAttachment))
 
-	// UI: either embedded/configured static FS, or a minimal placeholder page.
-	mux.HandleFunc("GET /", s.wrap(s.handleUI))
+	// UI assets are public so browsers can load CSS/JS without custom auth
+	// headers. API and attachment routes above remain token-protected.
+	mux.HandleFunc("GET /", s.handleUI)
 
 	// CORS preflight
 	mux.HandleFunc("OPTIONS /{path...}", s.wrap(s.handleOptions))
