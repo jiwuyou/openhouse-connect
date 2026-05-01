@@ -60,7 +60,7 @@ export default function Sidebar({ mobile = false, onNavigate }: SidebarProps) {
         </div>
         {!isCollapsed && (
           <span className="font-semibold text-gray-900 dark:text-white text-sm tracking-tight">
-            CC-Connect
+            openhouse-connect
           </span>
         )}
       </div>

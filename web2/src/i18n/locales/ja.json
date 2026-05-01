@@ -158,8 +158,8 @@
     "rawConfig": "生の設定"
   },
   "login": {
-    "title": "CC-Connect 管理コンソール",
-    "subtitle": "CC-Connect インスタンスに接続",
+    "title": "openhouse-connect 管理コンソール",
+    "subtitle": "openhouse-connect インスタンスに接続",
     "token": "API トークン",
     "serverUrl": "サーバー URL",
     "connect": "接続",
@@ -373,7 +373,7 @@
   },
   "help": {
     "badge": "ガイド",
-    "title": "CC-Connect の使い方",
+    "title": "openhouse-connect の使い方",
     "subtitle": "プロジェクト作成、プラットフォーム接続、Web チャット、セッション、プロバイダー、定期ジョブまでの基本操作をまとめています。",
     "quickStart": {
       "title": "クイックスタート",

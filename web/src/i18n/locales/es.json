@@ -158,8 +158,8 @@
     "rawConfig": "Config. sin procesar"
   },
   "login": {
-    "title": "CC-Connect Admin",
-    "subtitle": "Conéctese a su instancia de CC-Connect",
+    "title": "openhouse-connect Admin",
+    "subtitle": "Conéctese a su instancia de openhouse-connect",
     "token": "Token de API",
     "serverUrl": "URL del servidor",
     "connect": "Conectar",
@@ -373,7 +373,7 @@
   },
   "help": {
     "badge": "Guía",
-    "title": "Usar CC-Connect",
+    "title": "Usar openhouse-connect",
     "subtitle": "Flujo básico desde crear un proyecto y conectar plataformas hasta chat web, sesiones, proveedores y tareas programadas.",
     "quickStart": {
       "title": "Inicio rápido",

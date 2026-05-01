@@ -69,7 +69,7 @@ export default function Header({ onMenuClick }: HeaderProps) {
         <button type="button" onClick={onMenuClick} className={btnCls} aria-label="Menu">
           <Menu size={18} />
         </button>
-        <span className="text-sm font-semibold text-gray-900 dark:text-white truncate">CC-Connect</span>
+        <span className="text-sm font-semibold text-gray-900 dark:text-white truncate">openhouse-connect</span>
       </div>
 
       <div className="flex items-center justify-end gap-1 ml-auto">

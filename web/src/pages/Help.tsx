@@ -63,7 +63,7 @@ export default function Help() {
           </div>
           <div className="flex shrink-0 items-center gap-2 rounded-xl bg-gray-950 px-3 py-2 text-xs font-medium text-white dark:bg-white dark:text-gray-950">
             <Bot size={14} />
-            CC-Connect
+            openhouse-connect
           </div>
         </div>
       </section>
