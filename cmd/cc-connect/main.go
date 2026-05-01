@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -188,12 +189,24 @@ func main() {
 	// This is a first-class platform (like Feishu), not the Bridge frontend slot.
 	var webclientSrv *webclient.Server
 	if cfg.WebClient.Enabled != nil && *cfg.WebClient.Enabled {
+		managementBaseURL := ""
+		managementToken := ""
+		if cfg.Management.Enabled != nil && *cfg.Management.Enabled {
+			managementPort := cfg.Management.Port
+			if managementPort <= 0 {
+				managementPort = 9820
+			}
+			managementBaseURL = "http://" + net.JoinHostPort(localLoopbackHost(cfg.Management.Host), strconv.Itoa(managementPort))
+			managementToken = cfg.Management.Token
+		}
 		opts := webclient.Options{
-			Host:      cfg.WebClient.Host,
-			Port:      cfg.WebClient.Port,
-			Token:     cfg.WebClient.Token,
-			DataDir:   cfg.WebClient.DataDir,
-			PublicURL: cfg.WebClient.PublicURL,
+			Host:              cfg.WebClient.Host,
+			Port:              cfg.WebClient.Port,
+			Token:             cfg.WebClient.Token,
+			DataDir:           cfg.WebClient.DataDir,
+			PublicURL:         cfg.WebClient.PublicURL,
+			ManagementBaseURL: managementBaseURL,
+			ManagementToken:   managementToken,
 		}
 		srv, err := webclient.NewServer(opts)
 		if err != nil {
@@ -1669,4 +1682,12 @@ func derefInt(v *int) int {
 		return 0
 	}
 	return *v
+}
+
+func localLoopbackHost(host string) string {
+	h := strings.TrimSpace(host)
+	if h == "" || h == "0.0.0.0" || h == "::" || h == "[::]" {
+		return "127.0.0.1"
+	}
+	return h
 }

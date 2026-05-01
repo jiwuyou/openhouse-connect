@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -33,6 +34,11 @@ type Options struct {
 	Token     string
 	DataDir   string
 	PublicURL string
+
+	// ManagementBaseURL points at the management web/API server that this
+	// webclient shell should call through its backend facade.
+	ManagementBaseURL string
+	ManagementToken   string
 }
 
 type Server struct {
@@ -51,6 +57,8 @@ type Server struct {
 
 	// static serves the webclient UI when configured or embedded.
 	static http.Handler
+
+	managementProxy *httputil.ReverseProxy
 }
 
 func NewServer(opts Options) (*Server, error) {
@@ -65,6 +73,7 @@ func NewServer(opts Options) (*Server, error) {
 		opts.Port = 9840
 	}
 	opts.PublicURL = strings.TrimRight(strings.TrimSpace(opts.PublicURL), "/")
+	opts.ManagementBaseURL = strings.TrimRight(strings.TrimSpace(opts.ManagementBaseURL), "/")
 
 	root := filepath.Join(opts.DataDir, "webclient")
 	st, err := store.New(root, opts.PublicURL)
@@ -79,6 +88,13 @@ func NewServer(opts Options) (*Server, error) {
 		projectHandlers: make(map[string]core.MessageHandler),
 	}
 	s.static = s.defaultStaticHandler()
+	if opts.ManagementBaseURL != "" {
+		if u, err := url.Parse(opts.ManagementBaseURL); err == nil && u.Scheme != "" && u.Host != "" {
+			s.managementProxy = s.newManagementProxy(u)
+		} else {
+			return nil, fmt.Errorf("webclient: invalid management_base_url %q", opts.ManagementBaseURL)
+		}
+	}
 	s.handler = s.newMux()
 	return s, nil
 }
@@ -156,9 +172,24 @@ func (s *Server) newMux() http.Handler {
 	mux.HandleFunc("GET /api/projects/{project}/sessions/{session}/events", s.wrap(s.handleEvents))
 	mux.HandleFunc("GET /attachments/{id}", s.wrap(s.handleGetAttachment))
 
+	// Management facade used by the copied web admin frontend served on 9840.
+	for _, method := range []string{
+		http.MethodGet,
+		http.MethodPost,
+		http.MethodPut,
+		http.MethodPatch,
+		http.MethodDelete,
+		http.MethodOptions,
+	} {
+		mux.HandleFunc(method+" /api/v1/{path...}", s.wrap(s.handleManagementProxy))
+	}
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete, http.MethodOptions} {
+		mux.HandleFunc(method+" /bridge/{path...}", s.handleBridgeProxy)
+	}
+
 	// UI assets are public so browsers can load CSS/JS without custom auth
 	// headers. API and attachment routes above remain token-protected.
-	mux.HandleFunc("GET /", s.handleUI)
+	mux.HandleFunc("/", s.handleUI)
 
 	// CORS preflight
 	mux.HandleFunc("OPTIONS /{path...}", s.wrap(s.handleOptions))
@@ -231,6 +262,10 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	s.mu.RLock()
 	h := s.static
 	s.mu.RUnlock()
@@ -239,6 +274,22 @@ func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.ServeHTTP(w, r)
+}
+
+func (s *Server) handleManagementProxy(w http.ResponseWriter, r *http.Request) {
+	if s.managementProxy == nil {
+		http.Error(w, "management proxy is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	s.managementProxy.ServeHTTP(w, r)
+}
+
+func (s *Server) handleBridgeProxy(w http.ResponseWriter, r *http.Request) {
+	if s.managementProxy == nil {
+		http.Error(w, "management proxy is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	s.managementProxy.ServeHTTP(w, r)
 }
 
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
@@ -443,6 +494,28 @@ func (s *Server) SetStaticFS(fsys fs.FS, root string) error {
 	return nil
 }
 
+func (s *Server) newManagementProxy(target *url.URL) *httputil.ReverseProxy {
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		req.Host = target.Host
+		if strings.HasPrefix(req.URL.Path, "/api/v1/") && strings.TrimSpace(s.opts.ManagementToken) != "" {
+			req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(s.opts.ManagementToken))
+			q := req.URL.Query()
+			q.Del("token")
+			req.URL.RawQuery = q.Encode()
+		} else if strings.HasPrefix(req.URL.Path, "/api/v1/") {
+			req.Header.Del("Authorization")
+		}
+	}
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		slog.Warn("webclient: management proxy failed", "path", r.URL.Path, "error", err)
+		http.Error(w, "management proxy failed", http.StatusBadGateway)
+	}
+	return proxy
+}
+
 func (s *Server) defaultStaticHandler() http.Handler {
 	fsys, root := embeddedStaticFS()
 	if fsys == nil {
@@ -466,7 +539,30 @@ func staticHandlerFromFS(fsys fs.FS, root string) (http.Handler, error) {
 		}
 		fsys = sub
 	}
-	return http.FileServer(http.FS(fsys)), nil
+	if _, err := fs.Stat(fsys, "index.html"); err != nil {
+		return nil, fmt.Errorf("webclient: static index.html: %w", err)
+	}
+	fileServer := http.FileServer(http.FS(fsys))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		urlPath := strings.TrimPrefix(r.URL.Path, "/")
+		if urlPath == "" {
+			urlPath = "index.html"
+		}
+		if f, err := fsys.Open(urlPath); err == nil {
+			_ = f.Close()
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		indexData, err := fs.ReadFile(fsys, "index.html")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(indexData)
+		}
+	}), nil
 }
 
 func (s *Server) attachmentURL(id string) string {

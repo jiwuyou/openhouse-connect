@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -288,14 +289,14 @@ func TestStaticUIIsServedWithoutToken(t *testing.T) {
 	ts := httptest.NewServer(s.handler)
 	t.Cleanup(ts.Close)
 
-	res, err := ts.Client().Get(ts.URL + "/styles.css")
+	res, err := ts.Client().Get(ts.URL + "/")
 	if err != nil {
-		t.Fatalf("GET styles.css: %v", err)
+		t.Fatalf("GET /: %v", err)
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(res.Body)
-		t.Fatalf("GET styles.css status=%d body=%s", res.StatusCode, string(b))
+		t.Fatalf("GET / status=%d body=%s", res.StatusCode, string(b))
 	}
 
 	apiRes, err := ts.Client().Get(ts.URL + "/api/projects/proj/sessions")
@@ -305,5 +306,133 @@ func TestStaticUIIsServedWithoutToken(t *testing.T) {
 	defer apiRes.Body.Close()
 	if apiRes.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("GET sessions status=%d want 401", apiRes.StatusCode)
+	}
+}
+
+func TestManagementProxyInjectsManagementToken(t *testing.T) {
+	var gotPath, gotAuth, gotQuery string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"data":{"name":"management"}}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	s, err := NewServer(Options{
+		Host:              "",
+		Port:              9831,
+		Token:             "web-secret",
+		DataDir:           t.TempDir(),
+		ManagementBaseURL: upstream.URL,
+		ManagementToken:   "mgmt-secret",
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	ts := httptest.NewServer(s.handler)
+	t.Cleanup(ts.Close)
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/status?token=web-secret", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer web-secret")
+	res, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("GET proxy: %v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(res.Body)
+		t.Fatalf("GET proxy status=%d body=%s", res.StatusCode, string(b))
+	}
+	if gotPath != "/api/v1/status" {
+		t.Fatalf("upstream path=%q", gotPath)
+	}
+	if gotQuery != "" {
+		t.Fatalf("upstream query=%q want empty", gotQuery)
+	}
+	if gotAuth != "Bearer mgmt-secret" {
+		t.Fatalf("upstream Authorization=%q", gotAuth)
+	}
+}
+
+func TestBridgeProxyPreservesBridgeToken(t *testing.T) {
+	var gotPath, gotQuery, gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(upstream.Close)
+
+	s, err := NewServer(Options{
+		Host:              "",
+		Port:              9831,
+		Token:             "web-secret",
+		DataDir:           t.TempDir(),
+		ManagementBaseURL: upstream.URL,
+		ManagementToken:   "mgmt-secret",
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	ts := httptest.NewServer(s.handler)
+	t.Cleanup(ts.Close)
+
+	res, err := ts.Client().Get(ts.URL + "/bridge/ws?token=bridge-secret")
+	if err != nil {
+		t.Fatalf("GET bridge proxy: %v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("GET bridge proxy status=%d", res.StatusCode)
+	}
+	if gotPath != "/bridge/ws" {
+		t.Fatalf("upstream path=%q", gotPath)
+	}
+	if gotQuery != "token=bridge-secret" {
+		t.Fatalf("upstream query=%q", gotQuery)
+	}
+	if gotAuth != "" {
+		t.Fatalf("upstream Authorization=%q want empty", gotAuth)
+	}
+}
+
+func TestStaticUIFallsBackToIndexForSPARoutes(t *testing.T) {
+	s, err := NewServer(Options{
+		Host:    "",
+		Port:    9831,
+		Token:   "secret",
+		DataDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if err := s.SetStaticFS(fstest.MapFS{
+		"index.html": {Data: []byte("<html>spa</html>")},
+		"assets/app.js": {
+			Data: []byte("console.log('app')"),
+		},
+	}, ""); err != nil {
+		t.Fatalf("SetStaticFS: %v", err)
+	}
+	ts := httptest.NewServer(s.handler)
+	t.Cleanup(ts.Close)
+
+	res, err := ts.Client().Get(ts.URL + "/projects/demo")
+	if err != nil {
+		t.Fatalf("GET SPA route: %v", err)
+	}
+	defer res.Body.Close()
+	b, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET SPA route status=%d body=%s", res.StatusCode, string(b))
+	}
+	if string(b) != "<html>spa</html>" {
+		t.Fatalf("SPA fallback body=%q", string(b))
 	}
 }

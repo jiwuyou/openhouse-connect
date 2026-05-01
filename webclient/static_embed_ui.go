@@ -7,7 +7,7 @@ import (
 
 // Embed UI assets under ui/static. Worker-2 owns the actual files.
 //
-//go:embed ui/static/*
+//go:embed all:ui/static
 var embeddedUI embed.FS
 
 func embeddedStaticFS() (fs.FS, string) {
