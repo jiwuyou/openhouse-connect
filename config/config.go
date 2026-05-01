@@ -142,7 +142,7 @@ type BridgeConfig struct {
 type WebClientConfig struct {
 	Enabled   *bool  `toml:"enabled"`              // default false
 	Host      string `toml:"host,omitempty"`       // listen host; empty means all interfaces
-	Port      int    `toml:"port,omitempty"`       // listen port; default 9830
+	Port      int    `toml:"port,omitempty"`       // listen port; default 9840
 	Token     string `toml:"token,omitempty"`      // shared secret for authentication (recommended)
 	PublicURL string `toml:"public_url,omitempty"` // optional: base URL for generating public attachment links
 	DataDir   string `toml:"data_dir,omitempty"`   // optional: storage directory; default inherits Config.DataDir
@@ -475,7 +475,7 @@ func applyConfigDefaults(cfg *Config) {
 
 	// WebClient defaults
 	if cfg.WebClient.Port <= 0 {
-		cfg.WebClient.Port = 9830
+		cfg.WebClient.Port = 9840
 	}
 	if strings.TrimSpace(cfg.WebClient.DataDir) == "" {
 		cfg.WebClient.DataDir = cfg.DataDir

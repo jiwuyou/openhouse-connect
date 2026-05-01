@@ -3,6 +3,11 @@
 
   const $ = (id) => /** @type {HTMLElement} */ (document.getElementById(id));
 
+  const app = $("app");
+  const drawerOverlay = $("drawerOverlay");
+  const menuBtn = /** @type {HTMLButtonElement} */ ($("menuBtn"));
+  const drawerCloseBtn = /** @type {HTMLButtonElement} */ ($("drawerCloseBtn"));
+
   const statusPill = $("statusPill");
   const statusText = $("statusText");
 
@@ -10,7 +15,18 @@
   const sessionInput = /** @type {HTMLInputElement} */ ($("sessionInput"));
   const applyBtn = /** @type {HTMLButtonElement} */ ($("applyBtn"));
   const sessionSelect = /** @type {HTMLSelectElement} */ ($("sessionSelect"));
+  const sessionFilter = /** @type {HTMLInputElement} */ ($("sessionFilter"));
+  const sessionList = $("sessionList");
   const refreshSessionsBtn = /** @type {HTMLButtonElement} */ ($("refreshSessionsBtn"));
+  const reloadBtn = /** @type {HTMLButtonElement} */ ($("reloadBtn"));
+  const projectBadge = $("projectBadge");
+  const sessionBadge = $("sessionBadge");
+  const tokenBtn = /** @type {HTMLButtonElement} */ ($("tokenBtn"));
+  const authDialog = /** @type {HTMLDialogElement} */ ($("authDialog"));
+  const authForm = /** @type {HTMLFormElement} */ ($("authForm"));
+  const tokenInput = /** @type {HTMLInputElement} */ ($("tokenInput"));
+  const clearTokenBtn = /** @type {HTMLButtonElement} */ ($("clearTokenBtn"));
+  const cancelTokenBtn = /** @type {HTMLButtonElement} */ ($("cancelTokenBtn"));
 
   const messageList = $("messageList");
   const newMsgBtn = /** @type {HTMLButtonElement} */ ($("newMsgBtn"));
@@ -37,6 +53,12 @@
   let reconnectAttempt = 0;
   /** @type {boolean} */
   let everConnectedForThisTarget = false;
+  /** @type {Array<{id:string,label:string}>} */
+  let sessionItems = [];
+  /** @type {boolean} */
+  let authPromptShown = false;
+
+  const tokenStorageKey = "openhouse_webclient_token";
 
   const setStatus = (mode, text) => {
     statusPill.classList.remove("pill--neutral", "pill--ok", "pill--warn", "pill--bad");
@@ -46,6 +68,20 @@
     statusText.textContent = text;
   };
 
+  const setDrawer = (open) => {
+    app.dataset.drawer = open ? "open" : "closed";
+    drawerOverlay.hidden = !open;
+  };
+
+  const updateTargetChrome = () => {
+    projectBadge.textContent = currentProject;
+    projectBadge.title = currentProject;
+    sessionBadge.textContent = currentSession;
+    sessionBadge.title = currentSession;
+    projectInput.value = currentProject;
+    sessionInput.value = currentSession;
+  };
+
   const readParams = () => {
     const u = new URL(window.location.href);
     const project = (u.searchParams.get("project") || "").trim();
@@ -53,16 +89,47 @@
     const t = (u.searchParams.get("token") || "").trim();
     if (project) currentProject = project;
     if (session) currentSession = session;
-    if (t) token = t;
+    token = (window.localStorage.getItem(tokenStorageKey) || "").trim();
+    if (t) {
+      token = t;
+      window.localStorage.setItem(tokenStorageKey, token);
+      u.searchParams.delete("token");
+      window.history.replaceState({}, "", u.toString());
+    }
   };
 
   const writeParams = () => {
     const u = new URL(window.location.href);
     u.searchParams.set("project", currentProject);
     u.searchParams.set("session", currentSession);
-    if (token) u.searchParams.set("token", token);
-    else u.searchParams.delete("token");
+    u.searchParams.delete("token");
     window.history.replaceState({}, "", u.toString());
+  };
+
+  const saveToken = (value) => {
+    token = value.trim();
+    if (token) window.localStorage.setItem(tokenStorageKey, token);
+    else window.localStorage.removeItem(tokenStorageKey);
+    authPromptShown = false;
+    writeParams();
+  };
+
+  const openAuthDialog = () => {
+    tokenInput.value = token;
+    if (typeof authDialog.showModal === "function") {
+      authDialog.showModal();
+    } else {
+      authDialog.setAttribute("open", "");
+    }
+    window.setTimeout(() => tokenInput.focus(), 0);
+  };
+
+  const closeAuthDialog = () => {
+    if (typeof authDialog.close === "function") {
+      authDialog.close();
+    } else {
+      authDialog.removeAttribute("open");
+    }
   };
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -78,6 +145,19 @@
       const sep = path.includes("?") ? "&" : "?";
       if (path.includes("token=")) return path;
       return `${path}${sep}token=${encodeURIComponent(token)}`;
+    }
+  };
+
+  const assetUrl = (raw) => {
+    const value = String(raw || "");
+    if (!token || !value) return value;
+    try {
+      const u = new URL(value, window.location.origin);
+      if (u.origin !== window.location.origin) return value;
+      if (!u.searchParams.get("token")) u.searchParams.set("token", token);
+      return u.pathname + (u.search ? u.search : "");
+    } catch {
+      return value;
     }
   };
 
@@ -221,7 +301,7 @@
           img.className = "attimg";
           img.loading = "lazy";
           img.alt = name;
-          img.src = String(url); // keep as-is (backend may add ?token=)
+          img.src = assetUrl(url);
 
           const row = document.createElement("div");
           row.className = "att";
@@ -231,7 +311,7 @@
           badge.textContent = tag ? String(tag) : "image";
 
           const link = document.createElement("a");
-          link.href = String(url);
+          link.href = assetUrl(url);
           link.target = "_blank";
           link.rel = "noreferrer";
           link.textContent = name;
@@ -251,7 +331,7 @@
           badge.textContent = tag ? String(tag) : "file";
 
           const link = document.createElement("a");
-          link.href = String(url);
+          link.href = assetUrl(url);
           link.target = "_blank";
           link.rel = "noreferrer";
           link.textContent = name;
@@ -298,6 +378,14 @@
   const checkHealth = async () => {
     try {
       const res = await fetch(apiUrl("/healthz"), withAuth());
+      if (res.status === 401) {
+        setStatus("bad", "auth required");
+        if (!authPromptShown) {
+          authPromptShown = true;
+          openAuthDialog();
+        }
+        return false;
+      }
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       setStatus("ok", "connected");
       return true;
@@ -311,7 +399,6 @@
     const path = `/api/projects/${encodeURIComponent(currentProject)}/sessions`;
     const data = await fetchJson(path);
 
-    /** @type {Array<{id:string,label:string}>} */
     const items = [];
     if (Array.isArray(data)) {
       for (const x of data) {
@@ -329,6 +416,7 @@
     }
 
     items.sort((a, b) => a.id.localeCompare(b.id));
+    sessionItems = items;
 
     sessionSelect.textContent = "";
     const opt0 = document.createElement("option");
@@ -342,6 +430,49 @@
       opt.textContent = it.label;
       if (it.id === currentSession) opt.selected = true;
       sessionSelect.appendChild(opt);
+    }
+    renderSessionList();
+  };
+
+  const renderSessionList = () => {
+    const filter = sessionFilter.value.trim().toLowerCase();
+    const visible = filter
+      ? sessionItems.filter((it) => `${it.id} ${it.label}`.toLowerCase().includes(filter))
+      : sessionItems;
+
+    sessionList.textContent = "";
+    if (!visible.length) {
+      const empty = document.createElement("div");
+      empty.className = "sessionEmpty";
+      empty.textContent = sessionItems.length ? "No matches" : "No sessions";
+      sessionList.appendChild(empty);
+      return;
+    }
+
+    for (const it of visible) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "sessionItem";
+      btn.setAttribute("role", "option");
+      btn.setAttribute("aria-selected", it.id === currentSession ? "true" : "false");
+      btn.title = it.label;
+
+      const id = document.createElement("span");
+      id.className = "sessionItem__id";
+      id.textContent = it.label;
+
+      const tag = document.createElement("span");
+      tag.className = "sessionItem__tag";
+      tag.textContent = it.id === currentSession ? "active" : "open";
+
+      btn.appendChild(id);
+      btn.appendChild(tag);
+      btn.addEventListener("click", async () => {
+        sessionInput.value = it.id;
+        setDrawer(false);
+        await applyProjectSession();
+      });
+      sessionList.appendChild(btn);
     }
   };
 
@@ -442,6 +573,8 @@
     currentProject = p;
     currentSession = s;
     writeParams();
+    updateTargetChrome();
+    renderSessionList();
     if (!changed) return;
     reconnectAttempt = 0;
 
@@ -475,10 +608,36 @@
 
   const init = async () => {
     readParams();
-    projectInput.value = currentProject;
-    sessionInput.value = currentSession;
+    updateTargetChrome();
 
     setStatus("neutral", "disconnected");
+
+    tokenBtn.addEventListener("click", () => openAuthDialog());
+    authForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      saveToken(tokenInput.value);
+      closeAuthDialog();
+      try {
+        await loadSessions();
+      } catch {}
+      try {
+        await loadHistory();
+      } catch {}
+      await startEvents();
+    });
+    clearTokenBtn.addEventListener("click", async () => {
+      saveToken("");
+      closeAuthDialog();
+      await startEvents();
+    });
+    cancelTokenBtn.addEventListener("click", () => closeAuthDialog());
+
+    menuBtn.addEventListener("click", () => setDrawer(true));
+    drawerCloseBtn.addEventListener("click", () => setDrawer(false));
+    drawerOverlay.addEventListener("click", () => setDrawer(false));
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") setDrawer(false);
+    });
 
     newMsgBtn.addEventListener("click", () => {
       scrollToBottom();
@@ -498,6 +657,18 @@
         await loadSessions();
       } catch {}
     });
+
+    reloadBtn.addEventListener("click", async () => {
+      try {
+        await loadSessions();
+      } catch {}
+      try {
+        await loadHistory();
+      } catch {}
+      await startEvents();
+    });
+
+    sessionFilter.addEventListener("input", () => renderSessionList());
 
     sessionSelect.addEventListener("change", async () => {
       const v = sessionSelect.value.trim();

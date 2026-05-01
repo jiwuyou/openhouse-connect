@@ -292,10 +292,10 @@ level = "info" # debug, info, warn, error
 #
 # [webclient]
 # enabled = true
-# host = "127.0.0.1"                   # Listen host; omit/empty for all interfaces / 监听地址；留空监听所有地址
-# port = 9830                           # HTTP listen port (default: 9830) / 监听端口
+# host = ""                              # Listen host; omit/empty for all interfaces / 监听地址；留空监听所有地址
+# port = 9840                            # HTTP listen port (default: 9840) / 监听端口
 # token = "your-webclient-secret"       # Auth token / 认证密钥
-# public_url = "http://localhost:9830"  # Optional: public base URL for attachment links / 可选：附件公网基地址
+# public_url = "http://localhost:9840"  # Optional: public base URL for attachment links / 可选：附件公网基地址
 # data_dir = ""                         # Optional: storage dir (default: data_dir) / 可选：存储目录（默认继承 data_dir）
 
 # =============================================================================

@@ -8,80 +8,167 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <div id="app" class="app">
-      <header class="topbar">
-        <div class="brand">
-          <div class="brand__name">openhouse-connect</div>
-          <div id="statusPill" class="pill pill--neutral" title="Backend connectivity">
-            <span class="dot"></span>
-            <span id="statusText">disconnected</span>
+    <div id="app" class="shell" data-drawer="closed">
+      <div id="drawerOverlay" class="overlay" hidden></div>
+
+      <aside id="sidebar" class="sidebar" aria-label="Sidebar">
+        <div class="sidebarTop">
+          <div class="logo" aria-label="openhouse-connect">
+            <div class="logoMark" aria-hidden="true">
+              <div class="logoDot"></div>
+            </div>
+            <span class="logoText">openhouse-connect</span>
           </div>
+          <button id="drawerCloseBtn" class="iconbtn iconbtn--ghost drawerOnly" type="button" aria-label="Close menu">
+            <span class="iconbtn__icon" aria-hidden="true">✕</span>
+          </button>
         </div>
 
-        <div class="controls">
-          <label class="field">
-            <span class="field__label">Project</span>
-            <input
-              id="projectInput"
-              class="field__input"
-              type="text"
-              autocapitalize="off"
-              autocomplete="off"
-              spellcheck="false"
-            />
-          </label>
-
-          <label class="field">
-            <span class="field__label">Session</span>
-            <div class="field__row">
+        <div class="sidebarBody">
+          <div class="sideSection">
+            <div class="sideSection__title">Sessions</div>
+            <div class="sideRow">
               <input
-                id="sessionInput"
-                class="field__input field__input--session"
+                id="sessionFilter"
+                class="field__input field__input--compact"
+                type="text"
+                autocapitalize="off"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="Filter…"
+                aria-label="Filter sessions"
+              />
+              <button id="refreshSessionsBtn" class="iconbtn" type="button" title="Refresh sessions" aria-label="Refresh sessions">
+                <span class="iconbtn__icon" aria-hidden="true">↻</span>
+              </button>
+            </div>
+            <div id="sessionList" class="sessionList" role="listbox" aria-label="Sessions"></div>
+          </div>
+
+          <div class="sideSection">
+            <div class="sideSection__title">Target</div>
+            <label class="field field--tight">
+              <span class="field__label">Project</span>
+              <input
+                id="projectInput"
+                class="field__input"
                 type="text"
                 autocapitalize="off"
                 autocomplete="off"
                 spellcheck="false"
               />
-              <button id="applyBtn" class="iconbtn" type="button" title="Apply project/session">
-                <span class="iconbtn__text">Go</span>
-              </button>
-            </div>
-          </label>
+            </label>
 
-          <label class="field">
-            <span class="field__label">Sessions</span>
-            <div class="field__row">
-              <select id="sessionSelect" class="field__select" aria-label="Session list"></select>
-              <button id="refreshSessionsBtn" class="iconbtn" type="button" title="Refresh session list">
-                <span class="iconbtn__text">R</span>
-              </button>
-            </div>
-          </label>
+            <label class="field field--tight">
+              <span class="field__label">Session</span>
+              <div class="field__row">
+                <input
+                  id="sessionInput"
+                  class="field__input field__input--session"
+                  type="text"
+                  autocapitalize="off"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+                <button id="applyBtn" class="iconbtn" type="button" title="Apply project/session" aria-label="Apply project/session">
+                  <span class="iconbtn__text">Go</span>
+                </button>
+              </div>
+            </label>
+
+            <label class="field field--tight">
+              <span class="field__label">Quick Pick</span>
+              <select id="sessionSelect" class="field__select" aria-label="Session dropdown"></select>
+            </label>
+          </div>
         </div>
-      </header>
 
-      <main class="main">
-        <div id="messageList" class="messages" role="log" aria-live="polite" aria-relevant="additions text"></div>
-        <button id="newMsgBtn" class="newmsg" type="button" hidden>New messages</button>
-      </main>
+        <div class="sidebarFooter">
+          <div id="statusPill" class="pill pill--neutral" title="Backend connectivity">
+            <span class="dot"></span>
+            <span id="statusText">disconnected</span>
+          </div>
+        </div>
+      </aside>
 
-      <footer class="composerWrap">
-        <form id="composerForm" class="composer" autocomplete="off">
-          <textarea
-            id="composerInput"
-            class="composer__input"
-            rows="1"
-            placeholder="Message..."
-            autocapitalize="sentences"
-            autocomplete="off"
-            spellcheck="true"
-          ></textarea>
-          <button id="sendBtn" class="sendbtn" type="submit" title="Send">Send</button>
+      <div class="content">
+        <header class="header" role="banner">
+          <div class="headerLeft">
+            <button id="menuBtn" class="iconbtn iconbtn--ghost drawerOnly" type="button" aria-label="Open menu">
+              <span class="iconbtn__icon" aria-hidden="true">☰</span>
+            </button>
+            <div class="headerBrand drawerOnly" aria-label="openhouse-connect">
+              <span class="headerBrand__text">openhouse-connect</span>
+            </div>
+          </div>
+
+          <div class="headerCenter">
+            <div class="toolbar">
+              <div class="toolbarGroup">
+                <span class="toolbarLabel">Project</span>
+                <span id="projectBadge" class="badge badge--mono" title="Current project">default</span>
+              </div>
+              <div class="toolbarGroup">
+                <span class="toolbarLabel">Session</span>
+                <span id="sessionBadge" class="badge badge--mono" title="Current session">default</span>
+              </div>
+              <button id="reloadBtn" class="iconbtn" type="button" title="Reload messages" aria-label="Reload messages">
+                <span class="iconbtn__icon" aria-hidden="true">⟳</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="headerRight">
+            <button id="tokenBtn" class="iconbtn" type="button" title="Webclient token" aria-label="Webclient token">
+              <span class="iconbtn__text">Token</span>
+            </button>
+          </div>
+        </header>
+
+        <main class="main" role="main">
+          <div id="messageList" class="messages" role="log" aria-live="polite" aria-relevant="additions text"></div>
+          <button id="newMsgBtn" class="newmsg" type="button" hidden>New messages</button>
+        </main>
+
+        <footer class="composerWrap">
+          <form id="composerForm" class="composer" autocomplete="off">
+            <textarea
+              id="composerInput"
+              class="composer__input"
+              rows="1"
+              placeholder="Message…"
+              autocapitalize="sentences"
+              autocomplete="off"
+              spellcheck="true"
+            ></textarea>
+            <button id="sendBtn" class="sendbtn" type="submit" title="Send" aria-label="Send">
+              <span class="sendbtn__text">Send</span>
+            </button>
+          </form>
+        </footer>
+      </div>
+
+      <dialog id="authDialog" class="authDialog">
+        <form id="authForm" class="authForm" method="dialog" autocomplete="off">
+          <div class="authTitle">Webclient token</div>
+          <input
+            id="tokenInput"
+            class="field__input"
+            type="password"
+            autocomplete="current-password"
+            spellcheck="false"
+            placeholder="Token"
+            aria-label="Webclient token"
+          />
+          <div class="authActions">
+            <button id="clearTokenBtn" class="iconbtn iconbtn--ghost" type="button">Clear</button>
+            <button id="cancelTokenBtn" class="iconbtn iconbtn--ghost" type="button">Cancel</button>
+            <button class="sendbtn" type="submit">Save</button>
+          </div>
         </form>
-      </footer>
+      </dialog>
     </div>
 
     <script src="./app.js" defer></script>
   </body>
 </html>
-

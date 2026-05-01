@@ -1347,7 +1347,7 @@ data_dir = "/tmp/cc-connect-test"
 [webclient]
 enabled = true
 token = "test-token"
-public_url = "http://localhost:9830"
+public_url = "http://localhost:9840"
 
 [[projects]]
 name = "demo"
@@ -1357,14 +1357,14 @@ type = "claudecode"
 
 [projects.agent.options]
 mode = "default"
-`)
+	`)
 
 	cfg, err := Load(configPath)
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)
 	}
-	if cfg.WebClient.Port != 9830 {
-		t.Fatalf("cfg.WebClient.Port = %d, want %d", cfg.WebClient.Port, 9830)
+	if cfg.WebClient.Port != 9840 {
+		t.Fatalf("cfg.WebClient.Port = %d, want %d", cfg.WebClient.Port, 9840)
 	}
 	if cfg.WebClient.DataDir != cfg.DataDir {
 		t.Fatalf("cfg.WebClient.DataDir = %q, want %q", cfg.WebClient.DataDir, cfg.DataDir)

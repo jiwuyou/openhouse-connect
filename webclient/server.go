@@ -62,7 +62,7 @@ func NewServer(opts Options) (*Server, error) {
 	}
 	opts.Host = strings.TrimSpace(opts.Host) // empty means listen on all interfaces
 	if opts.Port == 0 {
-		opts.Port = 9830
+		opts.Port = 9840
 	}
 	opts.PublicURL = strings.TrimRight(strings.TrimSpace(opts.PublicURL), "/")
 
