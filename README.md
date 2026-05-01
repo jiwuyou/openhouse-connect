@@ -88,7 +88,7 @@ MiniMax-M2.7 is a next-generation large language model designed for autonomous e
 <br>
 
 <p align="center">
-  <b>Control your local AI agents from any chat app. Anywhere, anytime.</b>
+  <b>OpenHouse Connect: mobile-first web access to your local AI agents.</b>
 </p>
 
 <p align="center">
@@ -98,10 +98,19 @@ MiniMax-M2.7 is a next-generation large language model designed for autonomous e
 </p>
 
 <p align="center">
-  This project is based on the original <b>cc-connect</b> project, which bridges local AI agents<br/>
-  such as Claude Code, Codex, Gemini CLI, Cursor, and OpenCode to messaging platforms.<br/>
   OpenHouse Connect keeps that foundation while placing special emphasis on the <b>mobile web client experience</b>:<br/>
   responsive layouts, reliable image/file delivery, multi-frontend access, and touch-first daily use.
+</p>
+
+<p align="center">
+  <b>Original project: cc-connect</b><br/>
+  Control your local AI agents from any chat app. Anywhere, anytime.
+</p>
+
+<p align="center">
+  cc-connect bridges AI agents running on your machine to the messaging platforms you already use.<br/>
+  Code review, research, automation, data analysis — anything an AI agent can do,<br/>
+  now accessible from your phone, tablet, or any device with a chat app.
 </p>
 
 <p align="center">
