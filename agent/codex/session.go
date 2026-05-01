@@ -28,7 +28,7 @@ type codexSession struct {
 	model     string
 	effort    string
 	mode      string
-	baseURL   string   // provider base URL; passed as -c openai_base_url=<url>
+	baseURL   string // provider base URL; passed as -c openai_base_url=<url>
 	extraEnv  []string
 	events    chan core.Event
 	threadID  atomic.Value // stores string — Codex thread_id
@@ -51,6 +51,9 @@ type codexSession struct {
 	contextMu    sync.RWMutex
 	contextUsage *core.ContextUsage
 	sessionFile  string
+
+	turnStartedAt            time.Time
+	deliveredGeneratedImages map[string]struct{}
 }
 
 var codexSessionCloseTimeout = 8 * time.Second
@@ -122,6 +125,7 @@ func (cs *codexSession) Send(prompt string, images []core.ImageAttachment, files
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 
+	cs.turnStartedAt = time.Now()
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("codexSession: start: %w", err)
 	}
@@ -310,6 +314,7 @@ func (cs *codexSession) handleEvent(raw map[string]any) {
 
 	case "turn.started":
 		cs.pendingMsgs = cs.pendingMsgs[:0]
+		cs.turnStartedAt = time.Now()
 		cs.contextMu.Lock()
 		cs.contextUsage = nil
 		cs.contextMu.Unlock()
@@ -323,8 +328,9 @@ func (cs *codexSession) handleEvent(raw map[string]any) {
 
 	case "turn.completed":
 		cs.refreshContextUsageFromRollout()
+		images := cs.collectGeneratedImages()
 		cs.flushPendingAsText()
-		evt := core.Event{Type: core.EventResult, SessionID: cs.CurrentSessionID(), Done: true}
+		evt := core.Event{Type: core.EventResult, SessionID: cs.CurrentSessionID(), Done: true, Images: images}
 		select {
 		case cs.events <- evt:
 		case <-cs.ctx.Done():
@@ -358,6 +364,14 @@ func (cs *codexSession) handleEvent(raw map[string]any) {
 	default:
 		slog.Debug("codexSession: unhandled event type", "type", eventType)
 	}
+}
+
+func (cs *codexSession) collectGeneratedImages() []core.ImageAttachment {
+	if cs.deliveredGeneratedImages == nil {
+		cs.deliveredGeneratedImages = make(map[string]struct{})
+	}
+	codexHome := resolveCodexHomeForGeneratedImages(cs.extraEnv)
+	return collectCodexGeneratedImages(codexHome, cs.CurrentSessionID(), cs.turnStartedAt, cs.deliveredGeneratedImages)
 }
 
 // flushPendingAsThinking emits all buffered agent_messages as EventThinking.

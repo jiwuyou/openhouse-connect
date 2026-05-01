@@ -1634,6 +1634,38 @@ func TestProcessInteractiveEvents_DeliversTagOnlyArtifactWithoutEmptyReply(t *te
 	}
 }
 
+func TestProcessInteractiveEvents_DeliversEventImagesWithoutEmptyReply(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "test:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s1")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-1",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{
+		Type: EventResult,
+		Done: true,
+		Images: []ImageAttachment{{
+			MimeType: "image/png",
+			Data:     []byte("\x89PNG\r\n\x1a\nimage"),
+			FileName: "generated.png",
+		}},
+	}
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
+
+	if got := p.getSent(); len(got) != 0 {
+		t.Fatalf("sent text = %#v, want no empty text reply", got)
+	}
+	if images := p.getImages(); len(images) != 1 || images[0].FileName != "generated.png" {
+		t.Fatalf("images = %#v, want generated image", images)
+	}
+}
+
 func TestHandleMessage_InjectsCurrentSessionEnv(t *testing.T) {
 	p := &stubPlatformEngine{n: "webnew"}
 	agent := &sessionEnvRecordingAgent{session: newResultAgentSession("ok")}

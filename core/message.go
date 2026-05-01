@@ -290,6 +290,8 @@ type Event struct {
 	Error        error
 	InputTokens  int // token usage from agent result events
 	OutputTokens int
+	Images       []ImageAttachment
+	Files        []FileAttachment
 }
 
 // HistoryEntry is one turn in a conversation.

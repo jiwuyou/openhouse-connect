@@ -3289,7 +3289,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 			var artifactRefs []artifactReference
 			fullResponse, artifactRefs = extractArtifactReferences(fullResponse)
-			if fullResponse == "" && len(artifactRefs) == 0 {
+			if fullResponse == "" && len(artifactRefs) == 0 && len(event.Images) == 0 && len(event.Files) == 0 {
 				fullResponse = e.i18n.T(MsgEmptyResponse)
 			}
 			hasVisibleResponse := strings.TrimSpace(fullResponse) != ""
@@ -3397,6 +3397,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			if len(artifactRefs) > 0 {
 				e.deliverArtifactReferencesToState(e.ctx, state, artifactRefs)
+			}
+			if len(event.Images) > 0 || len(event.Files) > 0 {
+				e.deliverEventAttachmentsToState(e.ctx, state, event.Images, event.Files)
 			}
 
 			if elapsed := time.Since(replyStart); elapsed >= slowPlatformSend {

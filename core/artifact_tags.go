@@ -115,3 +115,28 @@ func (e *Engine) deliverArtifactReferencesToState(ctx context.Context, state *in
 		}
 	}
 }
+
+func (e *Engine) deliverEventAttachmentsToState(ctx context.Context, state *interactiveState, images []ImageAttachment, files []FileAttachment) {
+	for _, img := range images {
+		item := OutboxItem{
+			Path:     "agent-event:" + img.FileName,
+			FileName: img.FileName,
+			MimeType: img.MimeType,
+			Image:    &img,
+		}
+		if err := e.deliverOutboxItemToState(ctx, state, item); err != nil {
+			slog.Warn("agent event attachment: image deliver failed", "file", img.FileName, "mime", img.MimeType, "error", err)
+		}
+	}
+	for _, file := range files {
+		item := OutboxItem{
+			Path:     "agent-event:" + file.FileName,
+			FileName: file.FileName,
+			MimeType: file.MimeType,
+			File:     &file,
+		}
+		if err := e.deliverOutboxItemToState(ctx, state, item); err != nil {
+			slog.Warn("agent event attachment: file deliver failed", "file", file.FileName, "mime", file.MimeType, "error", err)
+		}
+	}
+}

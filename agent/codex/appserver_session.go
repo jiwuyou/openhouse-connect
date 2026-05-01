@@ -141,9 +141,11 @@ type appServerSession struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 
-	stateMu     sync.Mutex
-	pendingMsgs []string
-	currentTurn string
+	stateMu                  sync.Mutex
+	pendingMsgs              []string
+	currentTurn              string
+	turnStartedAt            time.Time
+	deliveredGeneratedImages map[string]struct{}
 
 	runtimeMu sync.RWMutex
 	usage     *core.UsageReport
@@ -446,6 +448,7 @@ func (s *appServerSession) Send(prompt string, images []core.ImageAttachment, fi
 	s.stateMu.Lock()
 	s.currentTurn = resp.Turn.ID
 	s.pendingMsgs = s.pendingMsgs[:0]
+	s.turnStartedAt = time.Now()
 	s.stateMu.Unlock()
 
 	return nil
@@ -689,6 +692,7 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 			s.stateMu.Lock()
 			s.currentTurn = notif.Turn.ID
 			s.pendingMsgs = s.pendingMsgs[:0]
+			s.turnStartedAt = time.Now()
 			s.stateMu.Unlock()
 			s.storeContextUsage(nil)
 		}
@@ -708,11 +712,13 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 	case "turn/completed":
 		var notif turnNotification
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+			images := s.collectGeneratedImages()
 			s.flushPendingAsText()
 			s.emit(core.Event{
 				Type:      core.EventResult,
 				SessionID: s.CurrentSessionID(),
 				Done:      true,
+				Images:    images,
 			})
 		}
 
@@ -1049,6 +1055,22 @@ func appServerJSON(v any) string {
 		return ""
 	}
 	return s
+}
+
+func (s *appServerSession) collectGeneratedImages() []core.ImageAttachment {
+	s.stateMu.Lock()
+	after := s.turnStartedAt
+	if s.deliveredGeneratedImages == nil {
+		s.deliveredGeneratedImages = make(map[string]struct{})
+	}
+	delivered := s.deliveredGeneratedImages
+	s.stateMu.Unlock()
+
+	codexHome := strings.TrimSpace(s.codexHome)
+	if codexHome == "" {
+		codexHome = resolveCodexHomeForGeneratedImages(s.extraEnv)
+	}
+	return collectCodexGeneratedImages(codexHome, s.CurrentSessionID(), after, delivered)
 }
 
 func toInt(v any) (int, bool) {
