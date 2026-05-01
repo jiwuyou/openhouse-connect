@@ -1,6 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import api from '@/api/client';
-import { DEFAULT_WEB_BRIDGE_PLATFORM, WEB_BRIDGE_USER_ID, WEB_BRIDGE_USER_NAME } from '@/lib/webPlatform';
+import { DEFAULT_WEB_BRIDGE_PLATFORM, WEB_BRIDGE_USER_ID, WEB_BRIDGE_USER_NAME, normalizeWebBridgePlatform } from '@/lib/webPlatform';
 
 type BridgeScoped = { session_key: string; session_id?: string };
 type BridgeReplyScoped = BridgeScoped & { reply_ctx: string };
@@ -24,6 +24,10 @@ export interface BridgeConfig {
   port: number;
   path: string;
   token: string;
+  frontend_path?: string;
+  client_path?: string;
+  frontend_token?: string;
+  service_platform?: string;
 }
 
 export type BridgeStatus = 'connecting' | 'registering' | 'connected' | 'disconnected' | 'error';
@@ -45,7 +49,8 @@ export function useBridgeSocket({ bridgeCfg, platformName = DEFAULT_WEB_BRIDGE_P
   onMessageRef.current = onMessage;
   const pingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [status, setStatus] = useState<BridgeStatus>('disconnected');
-  const visibleRoute = routeName || platformName || DEFAULT_WEB_BRIDGE_PLATFORM;
+  const visibleRoute = normalizeWebBridgePlatform(routeName || platformName || DEFAULT_WEB_BRIDGE_PLATFORM);
+  const servicePlatform = normalizeWebBridgePlatform(platformName || visibleRoute);
   const transportSessionKey = routeKey || sessionKey;
 
   const send = useCallback((data: Record<string, any>) => {
@@ -95,7 +100,9 @@ export function useBridgeSocket({ bridgeCfg, platformName = DEFAULT_WEB_BRIDGE_P
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     // Use current page host:port so the request goes through the Vite/nginx proxy
     // instead of directly hitting the bridge port (which may not be reachable).
-    const wsUrl = `${proto}//${window.location.host}${bridgeCfg.path}?token=${encodeURIComponent(bridgeCfg.token)}`;
+    const wsPath = bridgeCfg.frontend_path || bridgeCfg.client_path || bridgeCfg.path;
+    const wsToken = bridgeCfg.frontend_token || bridgeCfg.token;
+    const wsUrl = `${proto}//${window.location.host}${wsPath}?token=${encodeURIComponent(wsToken)}`;
 
     let ws: WebSocket;
     let reconnectTimer: ReturnType<typeof setTimeout>;
@@ -110,13 +117,22 @@ export function useBridgeSocket({ bridgeCfg, platformName = DEFAULT_WEB_BRIDGE_P
       ws.onopen = () => {
         setStatus('registering');
         ws.send(JSON.stringify({
-          type: 'register',
-          platform: platformName,
+          type: 'frontend_connect',
+          platform: servicePlatform,
+          slot: visibleRoute,
+          app: 'cc-connect-web',
+          session_key: sessionKey,
+          transport_session_key: transportSessionKey,
+          route: visibleRoute,
+          project: projectName || undefined,
           capabilities: ['text', 'card', 'buttons', 'typing', 'update_message', 'preview', 'reconstruct_reply'],
           metadata: {
             version: '1.0.0',
             description: 'Web Admin Dashboard',
+            client_kind: 'frontend_browser',
+            frontend_slot: visibleRoute,
             route: visibleRoute,
+            service_platform: servicePlatform,
             transport_session_key: transportSessionKey,
             project: projectName || '',
           },
@@ -165,7 +181,7 @@ export function useBridgeSocket({ bridgeCfg, platformName = DEFAULT_WEB_BRIDGE_P
       }
       setStatus('disconnected');
     };
-  }, [bridgeCfg, platformName, visibleRoute, transportSessionKey, projectName, send]);
+  }, [bridgeCfg, servicePlatform, visibleRoute, sessionKey, transportSessionKey, projectName, send]);
 
   return { status, send, sendMessage, sendCardAction, sendPreviewAck };
 }
@@ -179,6 +195,10 @@ export async function fetchBridgeConfig(): Promise<BridgeConfig | null> {
         port: status.bridge.port,
         path: status.bridge.path,
         token: status.bridge.token,
+        frontend_path: status.bridge.frontend_path,
+        client_path: status.bridge.client_path,
+        frontend_token: status.bridge.frontend_token,
+        service_platform: status.bridge.service_platform,
       };
     }
   } catch { /* bridge not available */ }

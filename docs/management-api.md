@@ -2,7 +2,7 @@
 
 > **Version:** 1.1-draft  
 > **Status:** Draft — subject to change before implementation  
-> **Last Updated:** 2026-03-24
+> **Last Updated:** 2026-04-30
 
 ---
 
@@ -173,6 +173,26 @@ Returns system status and summary.
     "uptime_seconds": 3600,
     "connected_platforms": ["feishu", "telegram"],
     "projects_count": 2,
+    "frontend_services": [
+      {
+        "app_id": "smallphone",
+        "app_name": "SmallPhone",
+        "project": "smallphone-3e9fc251",
+        "slot": "stable",
+        "url": "https://frontend.example/stable",
+        "enabled": true,
+        "service": {
+          "app_id": "smallphone",
+          "slot": "stable",
+          "service_id": "frontend-smallphone-stable",
+          "status": "online",
+          "version": "1.0.1",
+          "last_seen_at": "2026-04-30T10:00:00Z",
+          "expires_at": "2026-04-30T10:01:00Z",
+          "heartbeat_ttl_seconds": 60
+        }
+      }
+    ],
     "bridge_adapters": [
       {
         "platform": "custom",
@@ -190,6 +210,7 @@ Returns system status and summary.
 | `uptime_seconds`      | number   | Process uptime in seconds                        |
 | `connected_platforms` | string[] | Platform types currently connected               |
 | `projects_count`      | number   | Number of configured projects                    |
+| `frontend_services`   | array    | Backend-managed frontend slots and runtime service status |
 | `bridge_adapters`     | array   | External adapters connected via Bridge WebSocket |
 
 ---
@@ -1142,6 +1163,86 @@ Lists connected bridge adapters (external platforms via WebSocket).
 
 ---
 
+### 5.8 Frontend Apps and Slots
+
+Frontend slots describe configured, user-facing frontend entry points such as
+`stable`, `beta`, or `smallphone`. A slot is configured in the registry, while a
+backend frontend service registers runtime state and sends heartbeats. Browser
+tabs should connect through that frontend service; they are not registered as
+management slots or bridge adapters.
+
+#### GET /api/v1/apps
+
+Lists frontend apps. Each slot includes a `service` object with `status`:
+`offline`, `online`, or `stale`.
+
+#### POST /api/v1/apps
+
+Creates an app registry entry.
+
+```json
+{
+  "id": "smallphone",
+  "name": "SmallPhone",
+  "project": "smallphone-3e9fc251",
+  "metadata": {}
+}
+```
+
+#### GET /api/v1/apps/{app}
+
+Returns one app and its configured slots with runtime service status.
+
+#### POST /api/v1/apps/{app}/slots
+
+Creates or updates a configured slot.
+
+```json
+{
+  "slot": "stable",
+  "label": "Stable",
+  "url": "https://frontend.example/stable",
+  "api_base": "https://frontend.example/api",
+  "enabled": true,
+  "metadata": {}
+}
+```
+
+#### GET /api/v1/apps/{app}/slots/{slot}/service
+
+Returns the runtime service state for a configured slot. If no backend frontend
+service has registered, the status is `offline`.
+
+#### POST /api/v1/apps/{app}/slots/{slot}/service/register
+
+Registers the backend frontend service currently occupying a slot. This updates
+runtime state only and does not rewrite the persistent slot configuration.
+
+```json
+{
+  "service_id": "frontend-smallphone-stable",
+  "url": "http://127.0.0.1:18080",
+  "api_base": "http://127.0.0.1:3100/api",
+  "version": "1.0.1",
+  "build": "abc123",
+  "heartbeat_ttl_seconds": 60,
+  "metadata": {
+    "channel": "stable"
+  }
+}
+```
+
+#### POST /api/v1/apps/{app}/slots/{slot}/service/heartbeat
+
+Refreshes the registered service's `last_seen_at` and `expires_at`. If a service
+misses its heartbeat TTL, management views report the slot service as `stale`.
+
+#### DELETE /api/v1/apps/{app}/slots/{slot}/service
+
+Clears runtime service state for the slot and returns it to `offline`.
+
+---
+
 ## 6. Error Handling Conventions
 
 ### 6.1 Standard Error Response
@@ -1223,6 +1324,7 @@ If not configured, CORS may be disabled or use a default (e.g. `*` for same-orig
 
 | Version   | Date       | Changes                    |
 |-----------|------------|----------------------------|
+| 1.2-draft | 2026-04-30 | Add backend-managed frontend slots/services and service heartbeat status |
 | 1.1-draft | 2026-03-24 | Enrich session list/detail with `live`, `last_message`, `agent_type`, `user_name`, `chat_name`, `active_keys` fields |
 | 1.0-draft | 2026-03-10 | Initial specification      |
 

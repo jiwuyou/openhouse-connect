@@ -72,6 +72,29 @@ func registerWithMetadata(t *testing.T, conn *websocket.Conn, platform string, c
 	}
 }
 
+func frontendConnect(t *testing.T, conn *websocket.Conn, platform, sessionKey, project, clientID string) {
+	t.Helper()
+	msg := map[string]any{
+		"type":         "frontend_connect",
+		"platform":     platform,
+		"slot":         platform,
+		"route":        platform,
+		"client_id":    clientID,
+		"session_key":  sessionKey,
+		"project":      project,
+		"capabilities": []string{"text", "card", "buttons", "typing", "update_message", "preview", "reconstruct_reply"},
+	}
+	mustWriteJSON(t, conn, msg)
+	var ack map[string]any
+	mustReadJSON(t, conn, &ack)
+	if ack["ok"] != true {
+		t.Fatalf("frontend connect failed: %v", ack["error"])
+	}
+	if ack["frontend"] != true {
+		t.Fatalf("frontend ack missing frontend marker: %v", ack)
+	}
+}
+
 func readMsg(t *testing.T, conn *websocket.Conn) map[string]any {
 	t.Helper()
 	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -82,6 +105,18 @@ func readMsg(t *testing.T, conn *websocket.Conn) map[string]any {
 		t.Fatalf("read message: %v", err)
 	}
 	return m
+}
+
+func readMsgWithin(t *testing.T, conn *websocket.Conn, timeout time.Duration) (map[string]any, error) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	var m map[string]any
+	if err := conn.ReadJSON(&m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 func mustWriteJSON(t *testing.T, conn *websocket.Conn, v any) {
@@ -727,6 +762,282 @@ func TestBridge_AdapterReplace(t *testing.T) {
 	a := bs.getAdapter("replaceme")
 	if !a.capabilities["card"] {
 		t.Fatal("replaced adapter should have card capability")
+	}
+}
+
+func TestBridge_FrontendClientsShareServiceWithoutRegisteringAdapters(t *testing.T) {
+	bs, wsURL := startTestBridge(t, "")
+	sessionKey := "stable:web-admin:test-proj"
+
+	bp := bs.NewPlatform("test-proj")
+	e := NewEngine("test-proj", &stubAgent{}, []Platform{bp}, "", LangEnglish)
+	bs.RegisterEngine("test-proj", e, bp)
+	bp.handler = func(p Platform, msg *Message) {
+		rc, ok := msg.ReplyCtx.(*bridgeReplyCtx)
+		if !ok {
+			t.Errorf("reply ctx type = %T, want *bridgeReplyCtx", msg.ReplyCtx)
+			return
+		}
+		if rc.Platform != "stable" {
+			t.Errorf("reply ctx platform = %q, want stable", rc.Platform)
+		}
+		if rc.ClientID != "tab-1" {
+			t.Errorf("reply ctx client_id = %q, want tab-1", rc.ClientID)
+		}
+		if err := p.Reply(context.TODO(), msg.ReplyCtx, "pong"); err != nil {
+			t.Errorf("Reply: %v", err)
+		}
+	}
+
+	conn1 := dialWS(t, wsURL, nil)
+	frontendConnect(t, conn1, "stable", sessionKey, "test-proj", "tab-1")
+	conn2 := dialWS(t, wsURL, nil)
+	frontendConnect(t, conn2, "stable", sessionKey, "test-proj", "tab-2")
+
+	if adapters := bs.ConnectedAdapters(); len(adapters) != 0 {
+		t.Fatalf("frontend clients should not register bridge adapters, got %v", adapters)
+	}
+	services := bs.ConnectedFrontendServices()
+	if len(services) != 1 {
+		t.Fatalf("frontend services = %d, want 1", len(services))
+	}
+	if services[0].Platform != "stable" || services[0].ConnectedClients != 2 {
+		t.Fatalf("frontend service snapshot = %+v, want stable with 2 clients", services[0])
+	}
+
+	mustWriteJSON(t, conn1, map[string]any{
+		"type":        "message",
+		"msg_id":      "m1",
+		"session_key": sessionKey,
+		"session_id":  "s1",
+		"user_id":     "web-admin",
+		"user_name":   "Web Admin",
+		"content":     "ping",
+		"reply_ctx":   sessionKey,
+		"project":     "test-proj",
+	})
+
+	reply := readMsg(t, conn1)
+	if reply["type"] != "reply" || reply["content"] != "pong" {
+		t.Fatalf("reply = %v, want pong reply", reply)
+	}
+	if reply["session_key"] != sessionKey {
+		t.Fatalf("reply session_key = %q, want %q", reply["session_key"], sessionKey)
+	}
+	if _, err := readMsgWithin(t, conn2, 150*time.Millisecond); err == nil {
+		t.Fatal("second frontend client received targeted first-client reply")
+	}
+}
+
+func TestBridge_LegacyTabRegisterBecomesFrontendClient(t *testing.T) {
+	bs, wsURL := startTestBridge(t, "")
+	sessionKey := "beta:web-admin:test-proj"
+
+	bp := bs.NewPlatform("test-proj")
+	e := NewEngine("test-proj", &stubAgent{}, []Platform{bp}, "", LangEnglish)
+	bs.RegisterEngine("test-proj", e, bp)
+	bp.handler = func(p Platform, msg *Message) {
+		if msg.Platform != "beta" {
+			t.Errorf("message platform = %q, want beta", msg.Platform)
+		}
+		if err := p.Reply(context.TODO(), msg.ReplyCtx, "ok"); err != nil {
+			t.Errorf("Reply: %v", err)
+		}
+	}
+
+	conn := dialWS(t, wsURL, nil)
+	registerWithMetadata(t, conn, "beta-tab-abc-page", []string{"text", "card", "buttons"}, map[string]any{
+		"route":                 "beta",
+		"transport_session_key": sessionKey,
+		"project":               "test-proj",
+	})
+
+	if adapters := bs.ConnectedAdapters(); len(adapters) != 0 {
+		t.Fatalf("legacy tab registration should not create bridge adapters, got %v", adapters)
+	}
+	services := bs.ConnectedFrontendServices()
+	if len(services) != 1 || services[0].Platform != "beta" || services[0].ConnectedClients != 1 {
+		t.Fatalf("frontend services = %+v, want one beta service with one client", services)
+	}
+
+	mustWriteJSON(t, conn, map[string]any{
+		"type":                  "message",
+		"msg_id":                "m1",
+		"session_key":           sessionKey,
+		"transport_session_key": sessionKey,
+		"route":                 "beta",
+		"user_id":               "web-admin",
+		"content":               "hello",
+		"reply_ctx":             sessionKey,
+		"project":               "test-proj",
+	})
+
+	reply := readMsg(t, conn)
+	if reply["type"] != "reply" || reply["content"] != "ok" {
+		t.Fatalf("reply = %v, want ok reply", reply)
+	}
+}
+
+func TestBridge_FrontendPreviewAckRoutesThroughService(t *testing.T) {
+	bs, wsURL := startTestBridge(t, "")
+	sessionKey := "smallphone:web-admin:test-proj"
+	errCh := make(chan error, 1)
+
+	bp := bs.NewPlatform("test-proj")
+	e := NewEngine("test-proj", &stubAgent{}, []Platform{bp}, "", LangEnglish)
+	bs.RegisterEngine("test-proj", e, bp)
+	bp.handler = func(p Platform, msg *Message) {
+		go func() {
+			starter := p.(PreviewStarter)
+			updater := p.(MessageUpdater)
+			handle, err := starter.SendPreviewStart(context.Background(), msg.ReplyCtx, "thinking")
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if err := updater.UpdateMessage(context.Background(), handle, "updated"); err != nil {
+				errCh <- err
+				return
+			}
+			errCh <- nil
+		}()
+	}
+
+	conn := dialWS(t, wsURL, nil)
+	frontendConnect(t, conn, "smallphone", sessionKey, "test-proj", "phone-tab")
+
+	mustWriteJSON(t, conn, map[string]any{
+		"type":        "message",
+		"msg_id":      "m1",
+		"session_key": sessionKey,
+		"user_id":     "web-admin",
+		"content":     "stream",
+		"reply_ctx":   sessionKey,
+		"project":     "test-proj",
+	})
+
+	start := readMsg(t, conn)
+	if start["type"] != "preview_start" {
+		t.Fatalf("type = %q, want preview_start", start["type"])
+	}
+	refID, _ := start["ref_id"].(string)
+	if refID == "" {
+		t.Fatalf("preview_start missing ref_id: %v", start)
+	}
+	mustWriteJSON(t, conn, map[string]any{
+		"type":           "preview_ack",
+		"ref_id":         refID,
+		"preview_handle": "preview-1",
+	})
+
+	update := readMsg(t, conn)
+	if update["type"] != "update_message" {
+		t.Fatalf("type = %q, want update_message", update["type"])
+	}
+	if update["preview_handle"] != "preview-1" || update["content"] != "updated" {
+		t.Fatalf("update payload = %v, want preview-1 updated", update)
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("preview flow error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for preview flow")
+	}
+}
+
+func TestBridge_FrontendServicePreservesCardButtonsAndTyping(t *testing.T) {
+	bs, wsURL := startTestBridge(t, "")
+	sessionKey := "stable:web-admin:test-proj"
+
+	bp := bs.NewPlatform("test-proj")
+	e := NewEngine("test-proj", &stubAgent{}, []Platform{bp}, "", LangEnglish)
+	bs.RegisterEngine("test-proj", e, bp)
+	bp.handler = func(p Platform, msg *Message) {
+		stop := p.(TypingIndicator).StartTyping(context.Background(), msg.ReplyCtx)
+		stop()
+		if err := p.(InlineButtonSender).SendWithButtons(context.Background(), msg.ReplyCtx, "choose", [][]ButtonOption{{
+			{Text: "Yes", Data: "cmd:/yes"},
+		}}); err != nil {
+			t.Errorf("SendWithButtons: %v", err)
+			return
+		}
+		card := NewCard().Title("Card Title", "blue").Markdown("body").Build()
+		if err := p.(CardSender).SendCard(context.Background(), msg.ReplyCtx, card); err != nil {
+			t.Errorf("SendCard: %v", err)
+		}
+	}
+
+	conn := dialWS(t, wsURL, nil)
+	frontendConnect(t, conn, "stable", sessionKey, "test-proj", "tab-card")
+
+	mustWriteJSON(t, conn, map[string]any{
+		"type":        "message",
+		"msg_id":      "m1",
+		"session_key": sessionKey,
+		"user_id":     "web-admin",
+		"content":     "interactive",
+		"reply_ctx":   sessionKey,
+		"project":     "test-proj",
+	})
+
+	typingStart := readMsg(t, conn)
+	if typingStart["type"] != "typing_start" {
+		t.Fatalf("type = %q, want typing_start", typingStart["type"])
+	}
+	typingStop := readMsg(t, conn)
+	if typingStop["type"] != "typing_stop" {
+		t.Fatalf("type = %q, want typing_stop", typingStop["type"])
+	}
+	buttons := readMsg(t, conn)
+	if buttons["type"] != "buttons" || buttons["content"] != "choose" {
+		t.Fatalf("buttons payload = %v, want buttons choose", buttons)
+	}
+	cardMsg := readMsg(t, conn)
+	if cardMsg["type"] != "card" {
+		t.Fatalf("type = %q, want card", cardMsg["type"])
+	}
+	cardData, ok := cardMsg["card"].(map[string]any)
+	if !ok {
+		t.Fatalf("card = %T, want object", cardMsg["card"])
+	}
+	header, _ := cardData["header"].(map[string]any)
+	if header["title"] != "Card Title" {
+		t.Fatalf("card title = %v, want Card Title", header["title"])
+	}
+}
+
+func TestBridge_ReconstructReplyCtxFindsFrontendServiceForLogicalSessionKey(t *testing.T) {
+	bs, wsURL := startTestBridge(t, "")
+	logicalSessionKey := "webnew:web-admin:test-proj"
+
+	bp := bs.NewPlatform("test-proj")
+	conn := dialWS(t, wsURL, nil)
+	frontendConnect(t, conn, "stable", logicalSessionKey, "test-proj", "tab-logical")
+
+	replyCtx, err := bp.ReconstructReplyCtx(logicalSessionKey)
+	if err != nil {
+		t.Fatalf("ReconstructReplyCtx: %v", err)
+	}
+	rc, ok := replyCtx.(*bridgeReplyCtx)
+	if !ok {
+		t.Fatalf("reply ctx type = %T, want *bridgeReplyCtx", replyCtx)
+	}
+	if rc.Platform != "stable" {
+		t.Fatalf("reply ctx platform = %q, want stable", rc.Platform)
+	}
+
+	if err := bp.Reply(context.Background(), replyCtx, "proactive"); err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+	reply := readMsg(t, conn)
+	if reply["type"] != "reply" || reply["content"] != "proactive" {
+		t.Fatalf("reply = %v, want proactive reply", reply)
+	}
+	if reply["session_key"] != logicalSessionKey {
+		t.Fatalf("reply session_key = %q, want %q", reply["session_key"], logicalSessionKey)
 	}
 }
 

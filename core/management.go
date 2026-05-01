@@ -586,6 +586,14 @@ func (m *ManagementServer) handleStatus(w http.ResponseWriter, r *http.Request) 
 		"projects_count":      len(m.engines),
 		"bridge_adapters":     adapters,
 	}
+	if m.frontendRegistry != nil {
+		frontendServices, err := m.frontendRegistry.ListServiceSummaries()
+		if err != nil {
+			slog.Warn("management api: list frontend services failed", "error", err)
+		} else {
+			resp["frontend_services"] = frontendServices
+		}
+	}
 	if m.bridgeServer != nil {
 		resp["bridge"] = map[string]any{
 			"enabled":   true,
@@ -2028,6 +2036,16 @@ type frontendSlotPatchRequest struct {
 	Metadata        map[string]string `json:"metadata"`
 }
 
+type frontendServiceRequest struct {
+	ServiceID           string            `json:"service_id"`
+	URL                 string            `json:"url"`
+	APIBase             string            `json:"api_base"`
+	Version             string            `json:"version"`
+	Build               string            `json:"build"`
+	HeartbeatTTLSeconds int               `json:"heartbeat_ttl_seconds"`
+	Metadata            map[string]string `json:"metadata"`
+}
+
 func (m *ManagementServer) handleFrontendApps(w http.ResponseWriter, r *http.Request) {
 	if m.frontendRegistry == nil {
 		mgmtError(w, http.StatusServiceUnavailable, "frontend app registry not configured")
@@ -2036,7 +2054,7 @@ func (m *ManagementServer) handleFrontendApps(w http.ResponseWriter, r *http.Req
 
 	switch r.Method {
 	case http.MethodGet:
-		apps, err := m.frontendRegistry.ListApps()
+		apps, err := m.frontendRegistry.ListAppViews()
 		if err != nil {
 			mgmtError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -2064,7 +2082,12 @@ func (m *ManagementServer) handleFrontendApps(w http.ResponseWriter, r *http.Req
 			mgmtError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		mgmtJSON(w, http.StatusCreated, map[string]any{"app": app})
+		appView, ok, err := m.frontendRegistry.GetAppView(app.ID)
+		if err != nil || !ok {
+			mgmtJSON(w, http.StatusCreated, map[string]any{"app": app})
+			return
+		}
+		mgmtJSON(w, http.StatusCreated, map[string]any{"app": appView})
 
 	default:
 		mgmtError(w, http.StatusMethodNotAllowed, "GET or POST only")
@@ -2109,13 +2132,28 @@ func (m *ManagementServer) handleFrontendAppRoutes(w http.ResponseWriter, r *htt
 		m.handleFrontendSlotPromote(w, r, appID, parts[2])
 		return
 	}
+	if len(parts) == 4 && parts[3] == "service" {
+		m.handleFrontendSlotService(w, r, appID, parts[2])
+		return
+	}
+	if len(parts) == 5 && parts[3] == "service" {
+		switch parts[4] {
+		case "register":
+			m.handleFrontendSlotServiceRegister(w, r, appID, parts[2])
+		case "heartbeat":
+			m.handleFrontendSlotServiceHeartbeat(w, r, appID, parts[2])
+		default:
+			mgmtError(w, http.StatusNotFound, "not found")
+		}
+		return
+	}
 	mgmtError(w, http.StatusNotFound, "not found")
 }
 
 func (m *ManagementServer) handleFrontendAppDetail(w http.ResponseWriter, r *http.Request, appID string) {
 	switch r.Method {
 	case http.MethodGet:
-		app, ok, err := m.frontendRegistry.GetApp(appID)
+		app, ok, err := m.frontendRegistry.GetAppView(appID)
 		if err != nil {
 			mgmtError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -2142,7 +2180,12 @@ func (m *ManagementServer) handleFrontendAppDetail(w http.ResponseWriter, r *htt
 			mgmtError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		mgmtJSON(w, http.StatusOK, map[string]any{"app": app})
+		appView, ok, err := m.frontendRegistry.GetAppView(app.ID)
+		if err != nil || !ok {
+			mgmtJSON(w, http.StatusOK, map[string]any{"app": app})
+			return
+		}
+		mgmtJSON(w, http.StatusOK, map[string]any{"app": appView})
 
 	case http.MethodDelete:
 		if err := m.frontendRegistry.DeleteApp(appID); err != nil {
@@ -2159,7 +2202,7 @@ func (m *ManagementServer) handleFrontendAppDetail(w http.ResponseWriter, r *htt
 func (m *ManagementServer) handleFrontendSlots(w http.ResponseWriter, r *http.Request, appID string) {
 	switch r.Method {
 	case http.MethodGet:
-		slots, err := m.frontendRegistry.ListSlots(appID)
+		slots, err := m.frontendRegistry.ListSlotViews(appID)
 		if err != nil {
 			mgmtError(w, http.StatusNotFound, err.Error())
 			return
@@ -2189,7 +2232,12 @@ func (m *ManagementServer) handleFrontendSlots(w http.ResponseWriter, r *http.Re
 			mgmtError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		mgmtJSON(w, http.StatusCreated, map[string]any{"slot": slot})
+		slotView, ok, err := m.frontendRegistry.GetSlotView(appID, slot.Slot)
+		if err != nil || !ok {
+			mgmtJSON(w, http.StatusCreated, map[string]any{"slot": slot})
+			return
+		}
+		mgmtJSON(w, http.StatusCreated, map[string]any{"slot": slotView})
 
 	default:
 		mgmtError(w, http.StatusMethodNotAllowed, "GET or POST only")
@@ -2199,16 +2247,11 @@ func (m *ManagementServer) handleFrontendSlots(w http.ResponseWriter, r *http.Re
 func (m *ManagementServer) handleFrontendSlotDetail(w http.ResponseWriter, r *http.Request, appID, slotName string) {
 	switch r.Method {
 	case http.MethodGet:
-		app, ok, err := m.frontendRegistry.GetApp(appID)
+		slot, ok, err := m.frontendRegistry.GetSlotView(appID, slotName)
 		if err != nil {
-			mgmtError(w, http.StatusInternalServerError, err.Error())
+			mgmtError(w, http.StatusNotFound, err.Error())
 			return
 		}
-		if !ok {
-			mgmtError(w, http.StatusNotFound, "frontend app not found")
-			return
-		}
-		slot, ok := app.Slots[slotName]
 		if !ok {
 			mgmtError(w, http.StatusNotFound, "frontend slot not found")
 			return
@@ -2233,7 +2276,12 @@ func (m *ManagementServer) handleFrontendSlotDetail(w http.ResponseWriter, r *ht
 			mgmtError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		mgmtJSON(w, http.StatusOK, map[string]any{"slot": slot})
+		slotView, ok, err := m.frontendRegistry.GetSlotView(appID, slot.Slot)
+		if err != nil || !ok {
+			mgmtJSON(w, http.StatusOK, map[string]any{"slot": slot})
+			return
+		}
+		mgmtJSON(w, http.StatusOK, map[string]any{"slot": slotView})
 
 	case http.MethodDelete:
 		if err := m.frontendRegistry.DeleteSlot(appID, slotName); err != nil {
@@ -2267,10 +2315,108 @@ func (m *ManagementServer) handleFrontendSlotPromote(w http.ResponseWriter, r *h
 		mgmtError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	slotView, ok, viewErr := m.frontendRegistry.GetSlotView(appID, slot.Slot)
+	if viewErr == nil && ok {
+		mgmtJSON(w, http.StatusOK, map[string]any{
+			"message": "frontend slot promoted",
+			"slot":    slotView,
+		})
+		return
+	}
 	mgmtJSON(w, http.StatusOK, map[string]any{
 		"message": "frontend slot promoted",
 		"slot":    slot,
 	})
+}
+
+func (m *ManagementServer) handleFrontendSlotService(w http.ResponseWriter, r *http.Request, appID, slotName string) {
+	switch r.Method {
+	case http.MethodGet:
+		slot, ok, err := m.frontendRegistry.GetSlotView(appID, slotName)
+		if err != nil {
+			mgmtError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if !ok {
+			mgmtError(w, http.StatusNotFound, "frontend slot not found")
+			return
+		}
+		mgmtJSON(w, http.StatusOK, map[string]any{"service": slot.Service})
+
+	case http.MethodDelete:
+		if err := m.frontendRegistry.ClearSlotService(appID, slotName); err != nil {
+			mgmtError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		slot, ok, err := m.frontendRegistry.GetSlotView(appID, slotName)
+		if err != nil {
+			mgmtError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if !ok {
+			mgmtError(w, http.StatusNotFound, "frontend slot not found")
+			return
+		}
+		mgmtJSON(w, http.StatusOK, map[string]any{
+			"message": "frontend service cleared",
+			"service": slot.Service,
+		})
+
+	default:
+		mgmtError(w, http.StatusMethodNotAllowed, "GET or DELETE only")
+	}
+}
+
+func (m *ManagementServer) handleFrontendSlotServiceRegister(w http.ResponseWriter, r *http.Request, appID, slotName string) {
+	if r.Method != http.MethodPost {
+		mgmtError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	var body frontendServiceRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	service, err := m.frontendRegistry.RegisterSlotService(appID, slotName, FrontendServiceRegistration{
+		ServiceID:           body.ServiceID,
+		URL:                 body.URL,
+		APIBase:             body.APIBase,
+		Version:             body.Version,
+		Build:               body.Build,
+		HeartbeatTTLSeconds: body.HeartbeatTTLSeconds,
+		Metadata:            body.Metadata,
+	})
+	if err != nil {
+		mgmtError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	mgmtJSON(w, http.StatusOK, map[string]any{"service": service})
+}
+
+func (m *ManagementServer) handleFrontendSlotServiceHeartbeat(w http.ResponseWriter, r *http.Request, appID, slotName string) {
+	if r.Method != http.MethodPost {
+		mgmtError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	var body frontendServiceRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	service, err := m.frontendRegistry.HeartbeatSlotService(appID, slotName, FrontendServiceHeartbeat{
+		ServiceID:           body.ServiceID,
+		URL:                 body.URL,
+		APIBase:             body.APIBase,
+		Version:             body.Version,
+		Build:               body.Build,
+		HeartbeatTTLSeconds: body.HeartbeatTTLSeconds,
+		Metadata:            body.Metadata,
+	})
+	if err != nil {
+		mgmtError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	mgmtJSON(w, http.StatusOK, map[string]any{"service": service})
 }
 
 // ── Global provider endpoints ─────────────────────────────────

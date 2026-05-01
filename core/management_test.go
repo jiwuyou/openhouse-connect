@@ -884,6 +884,122 @@ func TestMgmt_FrontendAppsCRUDAndPromote(t *testing.T) {
 	}
 }
 
+func TestMgmt_FrontendSlotServiceRegisterHeartbeatAndStatus(t *testing.T) {
+	mgmt, ts, _ := testManagementServer(t, "tok")
+	storePath := filepath.Join(t.TempDir(), "frontend_apps.json")
+	mgmt.SetFrontendAppRegistry(NewFrontendAppRegistry(storePath))
+
+	r := mgmtPost(t, ts.URL+"/api/v1/apps", "tok", map[string]any{
+		"id":      "smallphone",
+		"name":    "SmallPhone",
+		"project": "smallphone-3e9fc251",
+	})
+	if !r.OK {
+		t.Fatalf("create frontend app failed: %s", r.Error)
+	}
+	r = mgmtPost(t, ts.URL+"/api/v1/apps/smallphone/slots", "tok", map[string]any{
+		"slot":     "stable",
+		"url":      "http://frontend.example/stable",
+		"api_base": "http://frontend.example/api",
+	})
+	if !r.OK {
+		t.Fatalf("create stable slot failed: %s", r.Error)
+	}
+
+	r = mgmtGet(t, ts.URL+"/api/v1/apps/smallphone/slots/stable/service", "tok")
+	if !r.OK {
+		t.Fatalf("get offline service failed: %s", r.Error)
+	}
+	var serviceData struct {
+		Service FrontendServiceState `json:"service"`
+	}
+	if err := json.Unmarshal(r.Data, &serviceData); err != nil {
+		t.Fatalf("unmarshal offline service: %v", err)
+	}
+	if serviceData.Service.Status != FrontendServiceStatusOffline {
+		t.Fatalf("initial service status = %q, want offline", serviceData.Service.Status)
+	}
+
+	r = mgmtPost(t, ts.URL+"/api/v1/apps/smallphone/slots/stable/service/register", "tok", map[string]any{
+		"service_id":            "frontend-smallphone-stable",
+		"url":                   "http://127.0.0.1:18080",
+		"api_base":              "http://127.0.0.1:3100/api",
+		"version":               "1.0.0",
+		"heartbeat_ttl_seconds": 120,
+		"metadata": map[string]string{
+			"channel": "stable",
+		},
+	})
+	if !r.OK {
+		t.Fatalf("register frontend service failed: %s", r.Error)
+	}
+	if err := json.Unmarshal(r.Data, &serviceData); err != nil {
+		t.Fatalf("unmarshal registered service: %v", err)
+	}
+	if serviceData.Service.Status != FrontendServiceStatusOnline {
+		t.Fatalf("registered service status = %q, want online", serviceData.Service.Status)
+	}
+	if serviceData.Service.ServiceID != "frontend-smallphone-stable" {
+		t.Fatalf("service id = %q", serviceData.Service.ServiceID)
+	}
+
+	r = mgmtPost(t, ts.URL+"/api/v1/apps/smallphone/slots/stable/service/heartbeat", "tok", map[string]any{
+		"service_id": "frontend-smallphone-stable",
+		"version":    "1.0.1",
+	})
+	if !r.OK {
+		t.Fatalf("heartbeat frontend service failed: %s", r.Error)
+	}
+	if err := json.Unmarshal(r.Data, &serviceData); err != nil {
+		t.Fatalf("unmarshal heartbeat service: %v", err)
+	}
+	if serviceData.Service.Version != "1.0.1" {
+		t.Fatalf("heartbeat version = %q, want 1.0.1", serviceData.Service.Version)
+	}
+
+	r = mgmtGet(t, ts.URL+"/api/v1/apps/smallphone/slots", "tok")
+	if !r.OK {
+		t.Fatalf("list slots failed: %s", r.Error)
+	}
+	var slotsData struct {
+		Slots []FrontendSlotView `json:"slots"`
+	}
+	if err := json.Unmarshal(r.Data, &slotsData); err != nil {
+		t.Fatalf("unmarshal slots: %v", err)
+	}
+	if len(slotsData.Slots) != 1 {
+		t.Fatalf("slots len = %d, want 1", len(slotsData.Slots))
+	}
+	if slotsData.Slots[0].Service.Status != FrontendServiceStatusOnline {
+		t.Fatalf("slot service status = %q, want online", slotsData.Slots[0].Service.Status)
+	}
+
+	r = mgmtGet(t, ts.URL+"/api/v1/status", "tok")
+	if !r.OK {
+		t.Fatalf("status failed: %s", r.Error)
+	}
+	var statusData struct {
+		FrontendServices []FrontendServiceSummary `json:"frontend_services"`
+	}
+	if err := json.Unmarshal(r.Data, &statusData); err != nil {
+		t.Fatalf("unmarshal status: %v", err)
+	}
+	if len(statusData.FrontendServices) != 1 {
+		t.Fatalf("frontend services len = %d, want 1", len(statusData.FrontendServices))
+	}
+	if statusData.FrontendServices[0].Service.ServiceID != "frontend-smallphone-stable" {
+		t.Fatalf("status service id = %q", statusData.FrontendServices[0].Service.ServiceID)
+	}
+
+	raw, err := os.ReadFile(storePath)
+	if err != nil {
+		t.Fatalf("read registry file: %v", err)
+	}
+	if strings.Contains(string(raw), "frontend-smallphone-stable") {
+		t.Fatalf("runtime service state was persisted: %s", string(raw))
+	}
+}
+
 func TestMgmt_FrontendAppsRequireRegistry(t *testing.T) {
 	_, ts, _ := testManagementServer(t, "tok")
 

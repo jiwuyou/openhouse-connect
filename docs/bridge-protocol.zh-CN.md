@@ -7,6 +7,8 @@
 
 Bridge 协议允许使用**任何编程语言**编写的外部平台适配器在运行时通过 WebSocket 动态接入 cc-connect，无需编写 Go 代码或重新编译二进制文件。
 
+同一个 WebSocket 端点也支持**前端服务客户端**。浏览器 tab 应该作为后端管理的前端服务/卡位客户端连接，例如 `stable`、`beta`、`smallphone`；不应再把浏览器 tab 注册成 Bridge 适配器。多个浏览器 tab 可以挂到同一个卡位下，互不替换、互不断开。
+
 ### 架构
 
 ```
@@ -90,6 +92,17 @@ token = "your-secret"     # 认证密钥，必填
   │──── close ─────────────────────→│  (优雅断开)
 ```
 
+前端客户端使用同一个 WebSocket 端点，但首帧发送 `frontend_connect`：
+
+```
+前端客户端                         cc-connect
+  │                                  │
+  │──── WebSocket 连接 ─────────────→│  (携带 token)
+  │──── frontend_connect ──────────→│  (声明前端服务/卡位)
+  │←─── register_ack ──────────────│  (`frontend: true`)
+  │←──→ message / reply 消息交换 ──→│
+```
+
 ---
 
 ## 消息协议
@@ -123,6 +136,57 @@ token = "your-secret"     # 认证密钥，必填
 | `capabilities` | string[] | 是 | 支持的能力列表（见[能力声明](#能力声明)）。 |
 | `metadata` | object | 否 | 自由格式的元信息，用于日志/调试。 |
 
+浏览器前端 tab 不应使用 `register`。请使用 `frontend_connect`，由后端管理卡位/服务身份，浏览器 tab 只作为客户端连接。兼容旧版本时，平台名包含 `-tab-`，或 metadata 同时包含 `route` 和 `transport_session_key` 的 Web 注册，会被当作前端客户端处理，而不是 Bridge 适配器。
+
+#### `frontend_connect`
+
+浏览器前端客户端连接后的首条消息。声明该客户端要挂载到哪个后端管理的前端服务/卡位。
+
+```json
+{
+  "type": "frontend_connect",
+  "platform": "stable",
+  "slot": "stable",
+  "app": "cc-connect-web",
+  "client_id": "browser-tab-123",
+  "session_key": "stable:web-admin:my-project",
+  "project": "my-project",
+  "capabilities": ["text", "card", "buttons", "typing", "update_message", "preview", "reconstruct_reply"],
+  "metadata": {
+    "version": "1.0.0"
+  }
+}
+```
+
+**字段说明：**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `type` | string | 是 | `"frontend_connect"` |
+| `platform` | string | 是* | 前端服务身份。通常就是卡位名，如 `stable`、`beta`、`smallphone`。省略 `slot` 时必填。 |
+| `slot` | string | 是* | 前端卡位名。省略 `platform` 时必填。 |
+| `app` | string | 否 | 前端应用 ID/名称。 |
+| `client_id` | string | 否 | 浏览器/客户端实例 ID。省略时由 cc-connect 生成。 |
+| `session_key` | string | 否 | 该客户端默认逻辑会话 key，通常为 `{slot}:web-admin:{project}`。 |
+| `transport_session_key` | string | 否 | 与 `session_key` 不同时使用的可选 legacy/投递会话 key。 |
+| `route` | string | 否 | 可选入口/路由名，默认使用 slot/platform。 |
+| `project` | string | 否 | session key 没有既有归属时用于路由的项目名。 |
+| `capabilities` | string[] | 否 | 前端渲染器支持的能力。省略时使用常见 Web 能力。 |
+| `metadata` | object | 否 | 自由格式的元信息，用于日志/调试。 |
+
+确认消息沿用 `register_ack` 结构，并增加前端字段：
+
+```json
+{
+  "type": "register_ack",
+  "ok": true,
+  "frontend": true,
+  "platform": "stable",
+  "slot": "stable",
+  "client_id": "browser-tab-123"
+}
+```
+
 #### `message`
 
 将用户消息传递给引擎。
@@ -155,6 +219,8 @@ token = "your-secret"     # 认证密钥，必填
 | `user_name` | string | 否 | 显示名称。 |
 | `content` | string | 是 | 文本内容。 |
 | `reply_ctx` | string | 是 | 不透明的上下文字符串，适配器需要它来路由回复。cc-connect 会在每个回复中原样回传。 |
+| `transport_session_key` | string | 否 | 前端客户端可选的投递/legacy 会话 key。 |
+| `route` | string | 否 | 可选前端入口/卡位提示。 |
 | `images` | Image[] | 否 | 附带的图片（见[图片对象](#图片对象)）。 |
 | `files` | File[] | 否 | 附带的文件（见[文件对象](#文件对象)）。 |
 | `audio` | Audio | 否 | 语音消息（见[音频对象](#音频对象)）。 |
@@ -182,6 +248,8 @@ token = "your-secret"     # 认证密钥，必填
 | `session_id` | string | 否 | `session_key` 下的 cc-connect 对话 ID。类消息动作（`perm:`、`askq:`、`cmd:`）会路由到该对话；回复/更新 payload 在提供时会回传该字段。当前原地更新的 `nav:`/`act:` handler 只接收 `session_key`，但返回 payload 仍会回传 `session_id`。省略时保持旧的活跃会话行为。 |
 | `action` | string | 是 | 按钮的回调值（如 `"cmd:/new"`、`"nav:/model"`、`"act:/heartbeat pause"`）。 |
 | `reply_ctx` | string | 是 | 用于路由响应的回复上下文。 |
+| `transport_session_key` | string | 否 | 前端客户端可选的投递/legacy 会话 key。 |
+| `route` | string | 否 | 可选前端入口/卡位提示。 |
 
 #### `preview_ack`
 
@@ -208,7 +276,9 @@ token = "your-secret"     # 认证密钥，必填
 
 ---
 
-### cc-connect → 适配器
+### cc-connect → 适配器 / 前端客户端
+
+出站消息对外部适配器和前端客户端使用相同 payload。对于前端客户端，如果原始消息/动作来自某个浏览器 tab，cc-connect 会把回复路由回该客户端；如果是通过 session key 重建的主动回复，则发送给该前端服务/会话下已连接的客户端。
 
 #### `register_ack`
 
@@ -595,6 +665,7 @@ Session key 遵循以下格式：
 - `wechat:user123:user123` — 私聊
 - `wechat:group456:user123` — 用户在群聊中
 - `matrix:room789:alice` — Matrix 聊天室
+- `stable:web-admin:my-project` — 某项目的 Web 前端卡位/服务
 
 适配器负责构建一致的 session key。
 

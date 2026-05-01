@@ -1,8 +1,8 @@
 # cc-connect 管理 API 规范
 
-> **版本：** 1.0-draft  
-> **状态：** 草案 — 实现前可能变更  
-> **最后更新：** 2026-03-10
+> **版本：** 1.1-draft
+> **状态：** 草案 — 实现前可能变更
+> **最后更新：** 2026-04-30
 
 ---
 
@@ -173,6 +173,26 @@ GET /api/v1/status?token=mgmt-secret
     "uptime_seconds": 3600,
     "connected_platforms": ["feishu", "telegram"],
     "projects_count": 2,
+    "frontend_services": [
+      {
+        "app_id": "smallphone",
+        "app_name": "SmallPhone",
+        "project": "smallphone-3e9fc251",
+        "slot": "stable",
+        "url": "https://frontend.example/stable",
+        "enabled": true,
+        "service": {
+          "app_id": "smallphone",
+          "slot": "stable",
+          "service_id": "frontend-smallphone-stable",
+          "status": "online",
+          "version": "1.0.1",
+          "last_seen_at": "2026-04-30T10:00:00Z",
+          "expires_at": "2026-04-30T10:01:00Z",
+          "heartbeat_ttl_seconds": 60
+        }
+      }
+    ],
     "bridge_adapters": [
       {
         "platform": "custom",
@@ -190,6 +210,7 @@ GET /api/v1/status?token=mgmt-secret
 | `uptime_seconds`       | number   | 进程运行时长（秒）                        |
 | `connected_platforms`  | string[] | 当前已连接的平台类型                      |
 | `projects_count`       | number   | 已配置项目数量                            |
+| `frontend_services`    | array    | 后端管理的前端卡位及其运行态服务状态      |
 | `bridge_adapters`      | array    | 通过 Bridge WebSocket 连接的外部适配器    |
 
 ---
@@ -1113,6 +1134,84 @@ GET /api/v1/status?token=mgmt-secret
 
 ---
 
+### 5.8 前端应用与卡位
+
+前端卡位描述面向用户的前端入口，例如 `stable`、`beta` 或 `smallphone`。
+卡位配置保存在 registry 中；后端前端服务通过注册和心跳上报运行态。
+浏览器 tab 应连接到对应前端服务，不作为管理卡位或 Bridge adapter 注册。
+
+#### GET /api/v1/apps
+
+列出前端应用。每个 slot 都带有 `service` 对象，其 `status` 为
+`offline`、`online` 或 `stale`。
+
+#### POST /api/v1/apps
+
+创建前端应用 registry 条目。
+
+```json
+{
+  "id": "smallphone",
+  "name": "SmallPhone",
+  "project": "smallphone-3e9fc251",
+  "metadata": {}
+}
+```
+
+#### GET /api/v1/apps/{app}
+
+返回单个应用、其已配置卡位，以及对应运行态服务状态。
+
+#### POST /api/v1/apps/{app}/slots
+
+创建或更新一个已配置卡位。
+
+```json
+{
+  "slot": "stable",
+  "label": "Stable",
+  "url": "https://frontend.example/stable",
+  "api_base": "https://frontend.example/api",
+  "enabled": true,
+  "metadata": {}
+}
+```
+
+#### GET /api/v1/apps/{app}/slots/{slot}/service
+
+返回某个已配置卡位的运行态服务状态。如果没有后端前端服务注册，
+状态为 `offline`。
+
+#### POST /api/v1/apps/{app}/slots/{slot}/service/register
+
+注册当前占用该卡位的后端前端服务。该操作只更新运行态状态，
+不会改写持久化的卡位配置。
+
+```json
+{
+  "service_id": "frontend-smallphone-stable",
+  "url": "http://127.0.0.1:18080",
+  "api_base": "http://127.0.0.1:3100/api",
+  "version": "1.0.1",
+  "build": "abc123",
+  "heartbeat_ttl_seconds": 60,
+  "metadata": {
+    "channel": "stable"
+  }
+}
+```
+
+#### POST /api/v1/apps/{app}/slots/{slot}/service/heartbeat
+
+刷新已注册服务的 `last_seen_at` 和 `expires_at`。如果服务超过 TTL
+没有心跳，管理视图会将该卡位服务报告为 `stale`。
+
+#### DELETE /api/v1/apps/{app}/slots/{slot}/service
+
+清理该卡位的运行态服务状态，并将其恢复为 `offline`。
+
+---
+
 ## 6. 错误处理约定
 
 ### 6.1 标准错误响应
@@ -1194,6 +1293,7 @@ cors_origins = ["http://localhost:3000", "https://dashboard.example.com"]
 
 | 版本       | 日期       | 变更                    |
 |------------|------------|-------------------------|
+| 1.1-draft  | 2026-04-30 | 新增后端管理的前端卡位/服务与服务心跳状态 |
 | 1.0-draft  | 2026-03-10 | 初始规范                |
 
 ---

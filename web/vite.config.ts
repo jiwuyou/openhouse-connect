@@ -6,6 +6,7 @@ const apiProxyTarget = process.env.VITE_API_PROXY_TARGET || 'http://localhost:98
 const bridgeProxyTarget = process.env.VITE_BRIDGE_PROXY_TARGET || 'http://localhost:9810'
 
 export default defineConfig({
+  cacheDir: path.resolve(__dirname, '.vite-cache'),
   plugins: [react()],
   resolve: {
     alias: {

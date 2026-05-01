@@ -1,11 +1,24 @@
 import api from './client';
+import type { BridgeAdapter, FrontendService } from './bridge';
 
 export interface SystemStatus {
   version: string;
   uptime_seconds: number;
   connected_platforms: string[];
   projects_count: number;
-  bridge_adapters: { platform: string; project: string; capabilities: string[] }[];
+  bridge_adapters: BridgeAdapter[];
+  frontend_services?: FrontendService[];
+  bridge?: {
+    enabled: boolean;
+    port: number;
+    path: string;
+    token: string;
+    token_set?: boolean;
+    frontend_path?: string;
+    client_path?: string;
+    frontend_token?: string;
+    service_platform?: string;
+  };
 }
 
 export const getStatus = () => api.get<SystemStatus>('/status');

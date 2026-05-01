@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { Badge, Button } from '@/components/ui';
 import { listSessions, getSession, createSession, updateSession, type Session, type SessionDetail } from '@/api/sessions';
+import { listProjectFrontendSlots, type FrontendSlot } from '@/api/bridge';
 import {
   useBridgeSocket, fetchBridgeConfig,
   type BridgeConfig, type BridgeIncoming, type BridgeStatus,
@@ -20,15 +21,17 @@ import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { cn } from '@/lib/utils';
 import {
+  frontendServicePlatformForSlot,
+  frontendSlotOptionsFrom,
   getInitialWebBridgePlatform,
-  getWebBridgeTransportPlatform,
   isLegacyWebBridgeSessionKey,
   legacyWebSessionKeys,
+  normalizeWebBridgePlatform,
   persistWebBridgePlatform,
   platformFromSessionKey,
+  selectedFrontendSlot,
   webRouteSessionKey,
   webSessionKey,
-  WEB_BRIDGE_PLATFORM_OPTIONS,
 } from '@/lib/webPlatform';
 
 // ── Markdown renderers ───────────────────────────────────────
@@ -468,6 +471,7 @@ export default function ChatView() {
   const [typing, setTyping] = useState(false);
   const [bridgeCfg, setBridgeCfg] = useState<BridgeConfig | null>(null);
   const [webPlatform, setWebPlatform] = useState(() => getInitialWebBridgePlatform());
+  const [frontendSlots, setFrontendSlots] = useState<FrontendSlot[]>([]);
   // Whether the user explicitly picked a session from the drawer
   const [userPickedSession, setUserPickedSession] = useState(false);
 
@@ -484,10 +488,16 @@ export default function ChatView() {
   // Mirrors cmdResult.command so card-action callbacks can route follow-ups back to the panel
   const cmdPanelRef = useRef<string | null>(null);
 
-  // webnew is the stable conversation identity. web2/web3/web5 remain delivery routes.
+  // webnew is the stable conversation identity. Frontend slots are delivery routes.
   const defaultWebSessionKey = projectName ? webSessionKey(projectName) : '';
-  const routeSessionKey = projectName ? webRouteSessionKey(projectName, webPlatform) : '';
-  const webTransportPlatform = useMemo(() => getWebBridgeTransportPlatform(webPlatform), [webPlatform]);
+  const frontendSlotOptions = useMemo(() => frontendSlotOptionsFrom(frontendSlots), [frontendSlots]);
+  const activeFrontendSlot = useMemo(() => selectedFrontendSlot(frontendSlotOptions, webPlatform), [frontendSlotOptions, webPlatform]);
+  const activeFrontendSlotName = activeFrontendSlot.slot;
+  const routeSessionKey = projectName ? webRouteSessionKey(projectName, activeFrontendSlotName) : '';
+  const webTransportPlatform = useMemo(
+    () => frontendServicePlatformForSlot(frontendSlotOptions, activeFrontendSlotName),
+    [frontendSlotOptions, activeFrontendSlotName],
+  );
   const sessionKey = userPickedSession && currentSession?.session_key
     ? currentSession.session_key
     : defaultWebSessionKey;
@@ -505,6 +515,13 @@ export default function ChatView() {
         fetchBridgeConfig(),
       ]);
       setBridgeCfg(cfg);
+      const slots = await listProjectFrontendSlots(projectName);
+      setFrontendSlots(slots);
+      const selectedSlot = selectedFrontendSlot(slots, webPlatform).slot;
+      if (selectedSlot !== normalizeWebBridgePlatform(webPlatform)) {
+        setWebPlatform(selectedSlot);
+        persistWebBridgePlatform(selectedSlot);
+      }
       const sorted = (allSessions || []).sort(
         (a, b) => (b.updated_at || b.created_at || '').localeCompare(a.updated_at || a.created_at || ''),
       );
@@ -556,7 +573,7 @@ export default function ChatView() {
     try {
       const detail = await getSession(projectName, s.id, 200);
       if (isLegacyWebBridgeSessionKey(detail.session_key)) {
-        const nextPlatform = platformFromSessionKey(detail.session_key);
+        const nextPlatform = normalizeWebBridgePlatform(platformFromSessionKey(detail.session_key));
         setWebPlatform(nextPlatform);
         persistWebBridgePlatform(nextPlatform);
       }
@@ -568,8 +585,9 @@ export default function ChatView() {
   }, [projectName]);
 
   const handleWebPlatformChange = useCallback((value: string) => {
-    setWebPlatform(value);
-    persistWebBridgePlatform(value);
+    const nextSlot = normalizeWebBridgePlatform(value);
+    setWebPlatform(nextSlot);
+    persistWebBridgePlatform(nextSlot);
     setUserPickedSession(false);
     setCurrentSession(null);
     setMessages([]);
@@ -679,7 +697,7 @@ export default function ChatView() {
   const { status: bridgeStatus, sendMessage: bridgeSend, sendCardAction, sendPreviewAck } = useBridgeSocket({
     bridgeCfg,
     platformName: webTransportPlatform,
-    routeName: webPlatform,
+    routeName: activeFrontendSlotName,
     sessionKey,
     sessionId: currentSessionId,
     routeKey: routeSessionKey,
@@ -812,16 +830,15 @@ export default function ChatView() {
               <h2 className="text-base sm:text-lg font-semibold text-gray-900 dark:text-white truncate max-w-[60vw] sm:max-w-none">{projectName}</h2>
               <StatusBadge status={bridgeStatus} />
               <select
-                value={webPlatform}
+                value={activeFrontendSlotName}
                 onChange={(e) => handleWebPlatformChange(e.target.value)}
                 className="h-8 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-2 text-xs text-gray-600 dark:text-gray-300 focus:outline-none focus:ring-2 focus:ring-accent/40 max-w-[45vw] sm:max-w-none"
-                title="Web route"
+                title="Frontend slot"
               >
-                {WEB_BRIDGE_PLATFORM_OPTIONS.includes(webPlatform) ? null : (
-                  <option value={webPlatform}>{webPlatform}</option>
-                )}
-                {WEB_BRIDGE_PLATFORM_OPTIONS.map((name) => (
-                  <option key={name} value={name}>{name}</option>
+                {frontendSlotOptions.map((slot) => (
+                  <option key={slot.slot} value={slot.slot}>
+                    {slot.label ? `${slot.label} (${slot.slot})` : slot.slot}
+                  </option>
                 ))}
               </select>
             </div>

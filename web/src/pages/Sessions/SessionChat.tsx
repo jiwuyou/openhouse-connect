@@ -12,6 +12,7 @@ import {
   DEFAULT_WEB_BRIDGE_PLATFORM,
   getWebBridgeTransportPlatform,
   isLegacyWebBridgeSessionKey,
+  normalizeWebBridgePlatform,
   platformFromSessionKey,
   webRouteSessionKey,
 } from '@/lib/webPlatform';
@@ -377,7 +378,7 @@ export default function SessionChat() {
   const sessionId = session?.id || '';
   const webRoute = useMemo(() => {
     if (isLegacyWebBridgeSessionKey(sessionKey)) {
-      return platformFromSessionKey(sessionKey) || DEFAULT_WEB_BRIDGE_PLATFORM;
+      return normalizeWebBridgePlatform(platformFromSessionKey(sessionKey));
     }
     return DEFAULT_WEB_BRIDGE_PLATFORM;
   }, [sessionKey]);

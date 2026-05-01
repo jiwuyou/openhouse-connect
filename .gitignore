@@ -48,6 +48,7 @@ package-lock.json
 node_modules/
 node_modules
 .vite/
+.vite-cache/
 *.tsbuildinfo
 
 # ============================================================================

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -32,7 +33,10 @@ type BridgeServer struct {
 	server      *http.Server
 
 	mu       sync.RWMutex
-	adapters map[string]*bridgeAdapter // platform name → adapter
+	adapters map[string]*bridgeAdapter // platform name → external adapter
+
+	frontendClientSeq uint64
+	frontendServices  map[string]*bridgeFrontendService // service platform/slot → frontend service
 
 	enginesMu sync.RWMutex
 	engines   map[string]*bridgeEngineRef // project name → engine ref
@@ -55,12 +59,68 @@ type bridgeAdapter struct {
 	previewRequests map[string]chan string // ref_id → channel receiving preview_handle
 }
 
+type bridgeFrontendService struct {
+	platform     string
+	app          string
+	slot         string
+	project      string
+	capabilities map[string]bool
+	metadata     map[string]any
+	adapter      *bridgeAdapter
+	clients      map[string]*bridgeFrontendClient
+	registeredAt time.Time
+	updatedAt    time.Time
+}
+
+type bridgeFrontendClient struct {
+	id                  string
+	platform            string
+	app                 string
+	slot                string
+	project             string
+	route               string
+	sessionKey          string
+	transportSessionKey string
+	conn                *websocket.Conn
+	writeMu             sync.Mutex
+	connectedAt         time.Time
+	lastSeen            time.Time
+}
+
+// BridgeFrontendServiceRegistration declares a backend-managed frontend service
+// identity. Browser tabs connect as clients of this service; they are not
+// bridge adapters and therefore do not replace adapter connections.
+type BridgeFrontendServiceRegistration struct {
+	Platform     string
+	App          string
+	Slot         string
+	Project      string
+	Capabilities []string
+	Metadata     map[string]any
+}
+
+// BridgeFrontendServiceInfo is a runtime snapshot for a frontend service.
+type BridgeFrontendServiceInfo struct {
+	Platform         string         `json:"platform"`
+	App              string         `json:"app,omitempty"`
+	Slot             string         `json:"slot,omitempty"`
+	Project          string         `json:"project,omitempty"`
+	Capabilities     []string       `json:"capabilities"`
+	Metadata         map[string]any `json:"metadata,omitempty"`
+	ConnectedClients int            `json:"connected_clients"`
+	RegisteredAt     time.Time      `json:"registered_at"`
+	UpdatedAt        time.Time      `json:"updated_at"`
+}
+
 // bridgeReplyCtx carries the information needed to route replies back to the adapter.
 type bridgeReplyCtx struct {
-	Platform   string `json:"platform"`
-	SessionKey string `json:"session_key"`
-	SessionID  string `json:"session_id,omitempty"`
-	ReplyCtx   string `json:"reply_ctx"`
+	Platform            string `json:"platform"`
+	SessionKey          string `json:"session_key"`
+	SessionID           string `json:"session_id,omitempty"`
+	ReplyCtx            string `json:"reply_ctx"`
+	TransportSessionKey string `json:"transport_session_key,omitempty"`
+	Route               string `json:"route,omitempty"`
+	ClientID            string `json:"client_id,omitempty"`
 
 	progressStyle               string `json:"-"`
 	supportsProgressCardPayload bool   `json:"-"`
@@ -106,28 +166,46 @@ type bridgeRegister struct {
 	Metadata     map[string]any `json:"metadata,omitempty"`
 }
 
+type bridgeFrontendConnect struct {
+	Type                string         `json:"type"`
+	Platform            string         `json:"platform,omitempty"`
+	App                 string         `json:"app,omitempty"`
+	Slot                string         `json:"slot,omitempty"`
+	Route               string         `json:"route,omitempty"`
+	ClientID            string         `json:"client_id,omitempty"`
+	SessionKey          string         `json:"session_key,omitempty"`
+	TransportSessionKey string         `json:"transport_session_key,omitempty"`
+	Capabilities        []string       `json:"capabilities,omitempty"`
+	Project             string         `json:"project,omitempty"`
+	Metadata            map[string]any `json:"metadata,omitempty"`
+}
+
 type bridgeMessage struct {
-	Type       string            `json:"type"`
-	MsgID      string            `json:"msg_id"`
-	SessionKey string            `json:"session_key"`
-	SessionID  string            `json:"session_id,omitempty"`
-	UserID     string            `json:"user_id"`
-	UserName   string            `json:"user_name,omitempty"`
-	Content    string            `json:"content"`
-	ReplyCtx   string            `json:"reply_ctx"`
-	Project    string            `json:"project,omitempty"`
-	Images     []bridgeImageData `json:"images,omitempty"`
-	Files      []bridgeFileData  `json:"files,omitempty"`
-	Audio      *bridgeAudioData  `json:"audio,omitempty"`
+	Type                string            `json:"type"`
+	MsgID               string            `json:"msg_id"`
+	SessionKey          string            `json:"session_key"`
+	SessionID           string            `json:"session_id,omitempty"`
+	UserID              string            `json:"user_id"`
+	UserName            string            `json:"user_name,omitempty"`
+	Content             string            `json:"content"`
+	ReplyCtx            string            `json:"reply_ctx"`
+	Project             string            `json:"project,omitempty"`
+	TransportSessionKey string            `json:"transport_session_key,omitempty"`
+	Route               string            `json:"route,omitempty"`
+	Images              []bridgeImageData `json:"images,omitempty"`
+	Files               []bridgeFileData  `json:"files,omitempty"`
+	Audio               *bridgeAudioData  `json:"audio,omitempty"`
 }
 
 type bridgeCardAction struct {
-	Type       string `json:"type"`
-	SessionKey string `json:"session_key"`
-	SessionID  string `json:"session_id,omitempty"`
-	Action     string `json:"action"`
-	ReplyCtx   string `json:"reply_ctx"`
-	Project    string `json:"project,omitempty"`
+	Type                string `json:"type"`
+	SessionKey          string `json:"session_key"`
+	SessionID           string `json:"session_id,omitempty"`
+	Action              string `json:"action"`
+	ReplyCtx            string `json:"reply_ctx"`
+	Project             string `json:"project,omitempty"`
+	TransportSessionKey string `json:"transport_session_key,omitempty"`
+	Route               string `json:"route,omitempty"`
 }
 
 type bridgePreviewAck struct {
@@ -170,12 +248,13 @@ func NewBridgeServer(port int, token, path string, corsOrigins []string) *Bridge
 		path = "/" + path
 	}
 	return &BridgeServer{
-		port:        port,
-		token:       token,
-		path:        path,
-		corsOrigins: corsOrigins,
-		adapters:    make(map[string]*bridgeAdapter),
-		engines:     make(map[string]*bridgeEngineRef),
+		port:             port,
+		token:            token,
+		path:             path,
+		corsOrigins:      corsOrigins,
+		adapters:         make(map[string]*bridgeAdapter),
+		frontendServices: make(map[string]*bridgeFrontendService),
+		engines:          make(map[string]*bridgeEngineRef),
 	}
 }
 
@@ -254,7 +333,13 @@ func (bs *BridgeServer) Stop() {
 	for _, a := range bs.adapters {
 		a.conn.Close()
 	}
+	for _, svc := range bs.frontendServices {
+		for _, c := range svc.clients {
+			c.conn.Close()
+		}
+	}
 	bs.adapters = make(map[string]*bridgeAdapter)
+	bs.frontendServices = make(map[string]*bridgeFrontendService)
 	bs.mu.Unlock()
 
 	if bs.server != nil {
@@ -275,6 +360,37 @@ func (bs *BridgeServer) ConnectedAdapters() []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+// RegisterFrontendService declares a backend-managed frontend slot/service.
+// The service can receive browser frontend clients without those clients
+// registering as bridge adapters.
+func (bs *BridgeServer) RegisterFrontendService(reg BridgeFrontendServiceRegistration) (BridgeFrontendServiceInfo, error) {
+	platform := bridgeFrontendServicePlatform(reg.Platform, reg.Slot, "", "", "")
+	if platform == "" {
+		return BridgeFrontendServiceInfo{}, fmt.Errorf("bridge: frontend service platform is required")
+	}
+	caps := bridgeCapabilitiesMap(reg.Capabilities)
+	if len(reg.Capabilities) == 0 {
+		caps = bridgeDefaultFrontendCapabilities()
+	}
+
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	now := time.Now().UTC()
+	svc := bs.ensureFrontendServiceLocked(platform, reg.App, reg.Slot, reg.Project, caps, reg.Metadata, now)
+	return bridgeFrontendServiceSnapshotLocked(svc), nil
+}
+
+// ConnectedFrontendServices returns runtime frontend service snapshots.
+func (bs *BridgeServer) ConnectedFrontendServices() []BridgeFrontendServiceInfo {
+	bs.mu.RLock()
+	defer bs.mu.RUnlock()
+	services := make([]BridgeFrontendServiceInfo, 0, len(bs.frontendServices))
+	for _, svc := range bs.frontendServices {
+		services = append(services, bridgeFrontendServiceSnapshotLocked(svc))
+	}
+	return services
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +440,7 @@ func (bp *BridgePlatform) Reply(ctx context.Context, replyCtx any, content strin
 	payload["reply_ctx"] = rc.ReplyCtx
 	payload["content"] = content
 	payload["format"] = "text"
-	return bp.server.sendToAdapter(rc.Platform, payload)
+	return bp.server.sendToReplyTarget(rc, payload)
 }
 
 func (bp *BridgePlatform) Send(ctx context.Context, replyCtx any, content string) error {
@@ -369,6 +485,22 @@ func newBridgeReplyCtxWithSessionID(a *bridgeAdapter, sessionKey, sessionID, rep
 	return rc
 }
 
+func newBridgeReplyCtxWithFrontendClient(a *bridgeAdapter, sessionKey, sessionID, replyCtx, transportSessionKey, route string, client *bridgeFrontendClient) *bridgeReplyCtx {
+	rc := newBridgeReplyCtxWithSessionID(a, sessionKey, sessionID, replyCtx)
+	if client != nil {
+		rc.ClientID = client.id
+		if transportSessionKey == "" {
+			transportSessionKey = client.transportSessionKey
+		}
+		if route == "" {
+			route = client.route
+		}
+	}
+	rc.TransportSessionKey = strings.TrimSpace(transportSessionKey)
+	rc.Route = strings.TrimSpace(route)
+	return rc
+}
+
 func bridgeOutboundBase(msgType string, rc *bridgeReplyCtx) map[string]any {
 	payload := map[string]any{
 		"type":        msgType,
@@ -376,6 +508,12 @@ func bridgeOutboundBase(msgType string, rc *bridgeReplyCtx) map[string]any {
 	}
 	if sessionID := strings.TrimSpace(rc.SessionID); sessionID != "" {
 		payload["session_id"] = sessionID
+	}
+	if transportSessionKey := strings.TrimSpace(rc.TransportSessionKey); transportSessionKey != "" {
+		payload["transport_session_key"] = transportSessionKey
+	}
+	if route := strings.TrimSpace(rc.Route); route != "" {
+		payload["route"] = route
 	}
 	return payload
 }
@@ -487,7 +625,7 @@ func (bp *BridgePlatform) SendCard(ctx context.Context, replyCtx any, card *Card
 	payload := bridgeOutboundBase("card", rc)
 	payload["reply_ctx"] = rc.ReplyCtx
 	payload["card"] = serializeCard(card)
-	return bp.server.sendToAdapter(rc.Platform, payload)
+	return bp.server.sendToReplyTarget(rc, payload)
 }
 
 func (bp *BridgePlatform) ReplyCard(ctx context.Context, replyCtx any, card *Card) error {
@@ -507,7 +645,7 @@ func (bp *BridgePlatform) SendWithButtons(ctx context.Context, replyCtx any, con
 	payload["reply_ctx"] = rc.ReplyCtx
 	payload["content"] = content
 	payload["buttons"] = buttons
-	return bp.server.sendToAdapter(rc.Platform, payload)
+	return bp.server.sendToReplyTarget(rc, payload)
 }
 
 func (bp *BridgePlatform) UpdateMessage(ctx context.Context, replyCtx any, content string) error {
@@ -522,7 +660,7 @@ func (bp *BridgePlatform) UpdateMessage(ctx context.Context, replyCtx any, conte
 	payload := bridgeOutboundBase("update_message", rc)
 	payload["preview_handle"] = rc.ReplyCtx
 	payload["content"] = content
-	return bp.server.sendToAdapter(rc.Platform, payload)
+	return bp.server.sendToReplyTarget(rc, payload)
 }
 
 func (bp *BridgePlatform) SendPreviewStart(ctx context.Context, replyCtx any, content string) (previewHandle any, err error) {
@@ -546,7 +684,7 @@ func (bp *BridgePlatform) SendPreviewStart(ctx context.Context, replyCtx any, co
 	payload["ref_id"] = refID
 	payload["reply_ctx"] = rc.ReplyCtx
 	payload["content"] = content
-	if err := bp.server.sendToAdapter(rc.Platform, payload); err != nil {
+	if err := bp.server.sendToReplyTarget(rc, payload); err != nil {
 		a.previewMu.Lock()
 		delete(a.previewRequests, refID)
 		a.previewMu.Unlock()
@@ -555,7 +693,11 @@ func (bp *BridgePlatform) SendPreviewStart(ctx context.Context, replyCtx any, co
 
 	select {
 	case handle := <-ch:
-		return newBridgeReplyCtxWithSessionID(a, rc.SessionKey, rc.SessionID, handle), nil
+		previewRC := newBridgeReplyCtxWithSessionID(a, rc.SessionKey, rc.SessionID, handle)
+		previewRC.TransportSessionKey = rc.TransportSessionKey
+		previewRC.Route = rc.Route
+		previewRC.ClientID = rc.ClientID
+		return previewRC, nil
 	case <-time.After(10 * time.Second):
 		a.previewMu.Lock()
 		delete(a.previewRequests, refID)
@@ -580,7 +722,7 @@ func (bp *BridgePlatform) DeletePreviewMessage(ctx context.Context, previewHandl
 	}
 	payload := bridgeOutboundBase("delete_message", rc)
 	payload["preview_handle"] = rc.ReplyCtx
-	return bp.server.sendToAdapter(rc.Platform, payload)
+	return bp.server.sendToReplyTarget(rc, payload)
 }
 
 func (bp *BridgePlatform) StartTyping(ctx context.Context, replyCtx any) (stop func()) {
@@ -594,11 +736,11 @@ func (bp *BridgePlatform) StartTyping(ctx context.Context, replyCtx any) (stop f
 	}
 	startPayload := bridgeOutboundBase("typing_start", rc)
 	startPayload["reply_ctx"] = rc.ReplyCtx
-	_ = bp.server.sendToAdapter(rc.Platform, startPayload)
+	_ = bp.server.sendToReplyTarget(rc, startPayload)
 	return func() {
 		stopPayload := bridgeOutboundBase("typing_stop", rc)
 		stopPayload["reply_ctx"] = rc.ReplyCtx
-		_ = bp.server.sendToAdapter(rc.Platform, stopPayload)
+		_ = bp.server.sendToReplyTarget(rc, stopPayload)
 	}
 }
 
@@ -615,7 +757,7 @@ func (bp *BridgePlatform) SendAudio(ctx context.Context, replyCtx any, audio []b
 	payload["reply_ctx"] = rc.ReplyCtx
 	payload["data"] = base64.StdEncoding.EncodeToString(audio)
 	payload["format"] = format
-	return bp.server.sendToAdapter(rc.Platform, payload)
+	return bp.server.sendToReplyTarget(rc, payload)
 }
 
 func (bp *BridgePlatform) SetCardNavigationHandler(h CardNavigationHandler) {
@@ -657,18 +799,44 @@ func (bs *BridgeServer) handleConnection(conn *websocket.Conn) {
 		return conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 	})
 
-	// First message must be "register"
+	// First message must identify either an external adapter ("register") or a
+	// browser frontend client ("frontend_connect").
 	_, raw, err := conn.ReadMessage()
 	if err != nil {
 		slog.Error("bridge: read register failed", "error", err)
 		return
 	}
 
-	var reg bridgeRegister
-	if err := json.Unmarshal(raw, &reg); err != nil || reg.Type != "register" {
-		if err := writeJSON(conn, nil, map[string]any{"type": "register_ack", "ok": false, "error": "first message must be register"}); err != nil {
+	var base bridgeMsg
+	if err := json.Unmarshal(raw, &base); err != nil {
+		if err := writeJSON(conn, nil, map[string]any{"type": "register_ack", "ok": false, "error": "first message must be register or frontend_connect"}); err != nil {
 			slog.Debug("bridge: write register ack failed", "error", err)
 		}
+		return
+	}
+
+	if base.Type == "frontend_connect" {
+		var fc bridgeFrontendConnect
+		if err := json.Unmarshal(raw, &fc); err != nil {
+			if err := writeJSON(conn, nil, map[string]any{"type": "register_ack", "ok": false, "error": "invalid frontend_connect payload"}); err != nil {
+				slog.Debug("bridge: write frontend ack failed", "error", err)
+			}
+			return
+		}
+		bs.handleFrontendConnection(conn, fc)
+		return
+	}
+
+	var reg bridgeRegister
+	if err := json.Unmarshal(raw, &reg); err != nil || reg.Type != "register" {
+		if err := writeJSON(conn, nil, map[string]any{"type": "register_ack", "ok": false, "error": "first message must be register or frontend_connect"}); err != nil {
+			slog.Debug("bridge: write register ack failed", "error", err)
+		}
+		return
+	}
+
+	if bridgeRegisterLooksLikeFrontendClient(reg) {
+		bs.handleFrontendConnection(conn, bridgeFrontendConnectFromRegister(reg))
 		return
 	}
 
@@ -679,11 +847,7 @@ func (bs *BridgeServer) handleConnection(conn *websocket.Conn) {
 		return
 	}
 
-	caps := make(map[string]bool, len(reg.Capabilities))
-	for _, c := range reg.Capabilities {
-		caps[c] = true
-	}
-	caps["text"] = true
+	caps := bridgeCapabilitiesMap(reg.Capabilities)
 
 	adapter := &bridgeAdapter{
 		platform:        reg.Platform,
@@ -762,11 +926,145 @@ func (bs *BridgeServer) handleConnection(conn *websocket.Conn) {
 	}
 }
 
+func (bs *BridgeServer) handleFrontendConnection(conn *websocket.Conn, fc bridgeFrontendConnect) {
+	client, svc, err := bs.registerFrontendClient(conn, fc)
+	if err != nil {
+		if writeErr := writeJSON(conn, nil, map[string]any{"type": "register_ack", "ok": false, "error": err.Error()}); writeErr != nil {
+			slog.Debug("bridge: write frontend ack failed", "error", writeErr)
+		}
+		return
+	}
+
+	if err := writeJSON(conn, &client.writeMu, map[string]any{
+		"type":      "register_ack",
+		"ok":        true,
+		"frontend":  true,
+		"platform":  svc.platform,
+		"slot":      svc.slot,
+		"client_id": client.id,
+	}); err != nil {
+		slog.Debug("bridge: write frontend ack failed", "platform", svc.platform, "client_id", client.id, "error", err)
+		return
+	}
+
+	slog.Info("bridge: frontend client connected",
+		"platform", svc.platform, "slot", svc.slot, "route", client.route,
+		"project", client.project, "client_id", client.id,
+	)
+
+	defer func() {
+		bs.unregisterFrontendClient(svc.platform, client.id)
+		slog.Info("bridge: frontend client disconnected", "platform", svc.platform, "client_id", client.id)
+	}()
+
+	for {
+		if err := conn.SetReadDeadline(time.Now().Add(90 * time.Second)); err != nil {
+			slog.Debug("bridge: set read deadline failed", "platform", svc.platform, "client_id", client.id, "error", err)
+			return
+		}
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+				slog.Debug("bridge: frontend read error", "platform", svc.platform, "client_id", client.id, "error", err)
+			}
+			return
+		}
+
+		bs.markFrontendClientSeen(svc.platform, client.id)
+
+		var base bridgeMsg
+		if err := json.Unmarshal(raw, &base); err != nil {
+			slog.Debug("bridge: invalid frontend JSON", "platform", svc.platform, "client_id", client.id, "error", err)
+			continue
+		}
+
+		switch base.Type {
+		case "message":
+			svc.adapter.handleMessageFromClient(raw, client)
+		case "card_action":
+			svc.adapter.handleCardActionFromClient(raw, client)
+		case "preview_ack":
+			svc.adapter.handlePreviewAck(raw)
+		case "ping":
+			if err := writeJSON(conn, &client.writeMu, map[string]any{"type": "pong", "ts": time.Now().UnixMilli()}); err != nil {
+				slog.Debug("bridge: write frontend pong failed", "platform", svc.platform, "client_id", client.id, "error", err)
+				return
+			}
+		default:
+			slog.Debug("bridge: unknown frontend message type", "platform", svc.platform, "client_id", client.id, "type", base.Type)
+		}
+	}
+}
+
+func (bs *BridgeServer) registerFrontendClient(conn *websocket.Conn, fc bridgeFrontendConnect) (*bridgeFrontendClient, *bridgeFrontendService, error) {
+	platform := bridgeFrontendServicePlatform(fc.Platform, fc.Slot, fc.Route, fc.TransportSessionKey, fc.SessionKey)
+	if platform == "" {
+		return nil, nil, fmt.Errorf("frontend service platform is required")
+	}
+	caps := bridgeCapabilitiesMap(fc.Capabilities)
+	if len(fc.Capabilities) == 0 {
+		caps = bridgeDefaultFrontendCapabilities()
+	}
+	now := time.Now().UTC()
+	clientID := strings.TrimSpace(fc.ClientID)
+	if clientID == "" {
+		clientID = fmt.Sprintf("frontend-%d-%d", now.UnixNano(), atomic.AddUint64(&bs.frontendClientSeq, 1))
+	}
+	client := &bridgeFrontendClient{
+		id:                  clientID,
+		platform:            platform,
+		app:                 strings.TrimSpace(fc.App),
+		slot:                strings.TrimSpace(fc.Slot),
+		project:             strings.TrimSpace(fc.Project),
+		route:               strings.TrimSpace(fc.Route),
+		sessionKey:          strings.TrimSpace(fc.SessionKey),
+		transportSessionKey: strings.TrimSpace(fc.TransportSessionKey),
+		conn:                conn,
+		connectedAt:         now,
+		lastSeen:            now,
+	}
+	if client.slot == "" {
+		client.slot = platform
+	}
+	if client.route == "" {
+		client.route = client.slot
+	}
+
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	svc := bs.ensureFrontendServiceLocked(platform, client.app, client.slot, client.project, caps, fc.Metadata, now)
+	svc.clients[client.id] = client
+	return client, svc, nil
+}
+
+func (bs *BridgeServer) unregisterFrontendClient(platform, clientID string) {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	if svc, ok := bs.frontendServices[platform]; ok {
+		delete(svc.clients, clientID)
+		svc.updatedAt = time.Now().UTC()
+	}
+}
+
+func (bs *BridgeServer) markFrontendClientSeen(platform, clientID string) {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	if svc, ok := bs.frontendServices[platform]; ok {
+		if client, ok := svc.clients[clientID]; ok {
+			client.lastSeen = time.Now().UTC()
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Adapter message handlers
 // ---------------------------------------------------------------------------
 
 func (a *bridgeAdapter) handleMessage(raw json.RawMessage) {
+	a.handleMessageFromClient(raw, nil)
+}
+
+func (a *bridgeAdapter) handleMessageFromClient(raw json.RawMessage, client *bridgeFrontendClient) {
 	var m bridgeMessage
 	if err := json.Unmarshal(raw, &m); err != nil {
 		slog.Debug("bridge: invalid message payload", "error", err)
@@ -778,9 +1076,13 @@ func (a *bridgeAdapter) handleMessage(raw json.RawMessage) {
 		return
 	}
 
-	ref := a.server.resolveEngine(m.SessionKey, m.Project)
+	project := m.Project
+	if project == "" && client != nil {
+		project = client.project
+	}
+	ref := a.server.resolveEngine(m.SessionKey, project)
 	if ref == nil {
-		slog.Warn("bridge: no engine for session", "platform", a.platform, "session_key", m.SessionKey, "project", m.Project)
+		slog.Warn("bridge: no engine for session", "platform", a.platform, "session_key", m.SessionKey, "project", project)
 		return
 	}
 
@@ -792,7 +1094,7 @@ func (a *bridgeAdapter) handleMessage(raw json.RawMessage) {
 		UserID:     m.UserID,
 		UserName:   m.UserName,
 		Content:    m.Content,
-		ReplyCtx:   newBridgeReplyCtxWithSessionID(a, m.SessionKey, m.SessionID, m.ReplyCtx),
+		ReplyCtx:   newBridgeReplyCtxWithFrontendClient(a, m.SessionKey, m.SessionID, m.ReplyCtx, m.TransportSessionKey, m.Route, client),
 	}
 
 	for _, img := range m.Images {
@@ -837,15 +1139,23 @@ func (a *bridgeAdapter) handleMessage(raw json.RawMessage) {
 }
 
 func (a *bridgeAdapter) handleCardAction(raw json.RawMessage) {
+	a.handleCardActionFromClient(raw, nil)
+}
+
+func (a *bridgeAdapter) handleCardActionFromClient(raw json.RawMessage, client *bridgeFrontendClient) {
 	var ca bridgeCardAction
 	if err := json.Unmarshal(raw, &ca); err != nil {
 		slog.Debug("bridge: invalid card_action payload", "error", err)
 		return
 	}
 
-	slog.Debug("bridge: card_action", "platform", a.platform, "action", ca.Action, "session_key", ca.SessionKey, "session_id", ca.SessionID, "project", ca.Project)
+	project := ca.Project
+	if project == "" && client != nil {
+		project = client.project
+	}
+	slog.Debug("bridge: card_action", "platform", a.platform, "action", ca.Action, "session_key", ca.SessionKey, "session_id", ca.SessionID, "project", project)
 
-	ref := a.server.resolveEngine(ca.SessionKey, ca.Project)
+	ref := a.server.resolveEngine(ca.SessionKey, project)
 	if ref == nil {
 		return
 	}
@@ -863,20 +1173,20 @@ func (a *bridgeAdapter) handleCardAction(raw json.RawMessage) {
 		default:
 			return
 		}
-		a.dispatchAsMessage(ref, ca.SessionKey, ca.SessionID, ca.ReplyCtx, responseText)
+		a.dispatchAsMessage(ref, ca.SessionKey, ca.SessionID, ca.ReplyCtx, responseText, ca.TransportSessionKey, ca.Route, client)
 		return
 	}
 
 	// askq: — AskUserQuestion answer; forward as a regular message
 	if strings.HasPrefix(ca.Action, "askq:") {
-		a.dispatchAsMessage(ref, ca.SessionKey, ca.SessionID, ca.ReplyCtx, ca.Action)
+		a.dispatchAsMessage(ref, ca.SessionKey, ca.SessionID, ca.ReplyCtx, ca.Action, ca.TransportSessionKey, ca.Route, client)
 		return
 	}
 
 	// cmd: — command shortcut from a card button; forward as a message
 	if strings.HasPrefix(ca.Action, "cmd:") {
 		cmdText := strings.TrimPrefix(ca.Action, "cmd:")
-		a.dispatchAsMessage(ref, ca.SessionKey, ca.SessionID, ca.ReplyCtx, cmdText)
+		a.dispatchAsMessage(ref, ca.SessionKey, ca.SessionID, ca.ReplyCtx, cmdText, ca.TransportSessionKey, ca.Route, client)
 		return
 	}
 
@@ -893,22 +1203,20 @@ func (a *bridgeAdapter) handleCardAction(raw json.RawMessage) {
 		return
 	}
 
+	rc := newBridgeReplyCtxWithFrontendClient(a, ca.SessionKey, ca.SessionID, ca.ReplyCtx, ca.TransportSessionKey, ca.Route, client)
 	if a.capabilities["card"] {
-		_ = a.server.sendToAdapter(a.platform, bridgeAddSessionID(map[string]any{
-			"type":        "card",
-			"session_key": ca.SessionKey,
-			"reply_ctx":   ca.ReplyCtx,
-			"card":        serializeCard(card),
-		}, ca.SessionID))
+		payload := bridgeOutboundBase("card", rc)
+		payload["reply_ctx"] = ca.ReplyCtx
+		payload["card"] = serializeCard(card)
+		_ = a.server.sendToReplyTarget(rc, payload)
 	} else {
-		rc := newBridgeReplyCtxWithSessionID(a, ca.SessionKey, ca.SessionID, ca.ReplyCtx)
 		_ = ref.platform.Reply(context.Background(), rc, card.RenderText())
 	}
 }
 
 // dispatchAsMessage converts a card action into a regular user message
 // and dispatches it to the engine's message handler.
-func (a *bridgeAdapter) dispatchAsMessage(ref *bridgeEngineRef, sessionKey, sessionID, replyCtx, content string) {
+func (a *bridgeAdapter) dispatchAsMessage(ref *bridgeEngineRef, sessionKey, sessionID, replyCtx, content, transportSessionKey, route string, client *bridgeFrontendClient) {
 	if ref.platform.handler == nil {
 		return
 	}
@@ -919,7 +1227,7 @@ func (a *bridgeAdapter) dispatchAsMessage(ref *bridgeEngineRef, sessionKey, sess
 		UserID:     "web-admin",
 		UserName:   "Web Admin",
 		Content:    content,
-		ReplyCtx:   newBridgeReplyCtxWithSessionID(a, sessionKey, sessionID, replyCtx),
+		ReplyCtx:   newBridgeReplyCtxWithFrontendClient(a, sessionKey, sessionID, replyCtx, transportSessionKey, route, client),
 	}
 	go ref.platform.handler(ref.platform, msg)
 }
@@ -1211,7 +1519,23 @@ func (bs *BridgeServer) authenticate(r *http.Request) bool {
 func (bs *BridgeServer) getAdapter(platform string) *bridgeAdapter {
 	bs.mu.RLock()
 	defer bs.mu.RUnlock()
-	return bs.adapters[platform]
+	if a := bs.adapters[platform]; a != nil {
+		return a
+	}
+	if svc := bs.frontendServices[platform]; svc != nil {
+		return svc.adapter
+	}
+	return nil
+}
+
+func (bs *BridgeServer) sendToReplyTarget(rc *bridgeReplyCtx, msg map[string]any) error {
+	if rc == nil {
+		return fmt.Errorf("bridge: missing reply target")
+	}
+	if strings.TrimSpace(rc.ClientID) != "" {
+		return bs.sendToFrontendTarget(rc.Platform, rc.ClientID, msg)
+	}
+	return bs.sendToAdapter(rc.Platform, msg)
 }
 
 func (bs *BridgeServer) sendToAdapter(platform string, msg map[string]any) error {
@@ -1219,9 +1543,250 @@ func (bs *BridgeServer) sendToAdapter(platform string, msg map[string]any) error
 	a, ok := bs.adapters[platform]
 	bs.mu.RUnlock()
 	if !ok {
-		return fmt.Errorf("bridge: adapter %q not connected", platform)
+		return bs.sendToFrontendTarget(platform, "", msg)
 	}
 	return writeJSON(a.conn, &a.writeMu, msg)
+}
+
+func (bs *BridgeServer) sendToFrontendTarget(platform, clientID string, msg map[string]any) error {
+	bs.mu.RLock()
+	svc, ok := bs.frontendServices[platform]
+	if !ok {
+		bs.mu.RUnlock()
+		return fmt.Errorf("bridge: adapter %q not connected", platform)
+	}
+
+	var clients []*bridgeFrontendClient
+	if clientID != "" {
+		if client := svc.clients[clientID]; client != nil {
+			clients = append(clients, client)
+		}
+	} else {
+		sessionKey, _ := msg["session_key"].(string)
+		route, _ := msg["route"].(string)
+		for _, client := range svc.clients {
+			if !bridgeFrontendClientMatches(client, sessionKey, route) {
+				continue
+			}
+			clients = append(clients, client)
+		}
+	}
+	bs.mu.RUnlock()
+
+	if len(clients) == 0 {
+		return fmt.Errorf("bridge: frontend service %q has no connected clients", platform)
+	}
+
+	var firstErr error
+	for _, client := range clients {
+		if err := writeJSON(client.conn, &client.writeMu, msg); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return fmt.Errorf("bridge: send to frontend service %q: %w", platform, firstErr)
+	}
+	return nil
+}
+
+func bridgeFrontendClientMatches(client *bridgeFrontendClient, sessionKey, route string) bool {
+	if client == nil {
+		return false
+	}
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey != "" {
+		if client.sessionKey != "" && client.sessionKey != sessionKey {
+			return false
+		}
+		if client.sessionKey == "" && client.transportSessionKey != "" && client.transportSessionKey != sessionKey {
+			return false
+		}
+	}
+	route = strings.TrimSpace(route)
+	if route != "" && client.route != "" && client.route != route {
+		return false
+	}
+	return true
+}
+
+func (bs *BridgeServer) ensureFrontendServiceLocked(platform, app, slot, project string, caps map[string]bool, metadata map[string]any, now time.Time) *bridgeFrontendService {
+	if bs.frontendServices == nil {
+		bs.frontendServices = make(map[string]*bridgeFrontendService)
+	}
+	if caps == nil {
+		caps = bridgeDefaultFrontendCapabilities()
+	}
+	svc := bs.frontendServices[platform]
+	if svc == nil {
+		adapter := &bridgeAdapter{
+			platform:        platform,
+			capabilities:    cloneBridgeCapabilities(caps),
+			metadata:        cloneBridgeMetadata(metadata),
+			server:          bs,
+			previewRequests: make(map[string]chan string),
+		}
+		svc = &bridgeFrontendService{
+			platform:     platform,
+			app:          strings.TrimSpace(app),
+			slot:         strings.TrimSpace(slot),
+			project:      strings.TrimSpace(project),
+			capabilities: adapter.capabilities,
+			metadata:     adapter.metadata,
+			adapter:      adapter,
+			clients:      make(map[string]*bridgeFrontendClient),
+			registeredAt: now,
+			updatedAt:    now,
+		}
+		if svc.slot == "" {
+			svc.slot = platform
+		}
+		bs.frontendServices[platform] = svc
+		return svc
+	}
+	if strings.TrimSpace(app) != "" {
+		svc.app = strings.TrimSpace(app)
+	}
+	if strings.TrimSpace(slot) != "" {
+		svc.slot = strings.TrimSpace(slot)
+	}
+	if strings.TrimSpace(project) != "" {
+		svc.project = strings.TrimSpace(project)
+	}
+	for capName, enabled := range caps {
+		if enabled {
+			svc.capabilities[capName] = true
+		}
+	}
+	if metadata != nil {
+		svc.metadata = cloneBridgeMetadata(metadata)
+		svc.adapter.metadata = svc.metadata
+	}
+	svc.updatedAt = now
+	return svc
+}
+
+func bridgeFrontendServiceSnapshotLocked(svc *bridgeFrontendService) BridgeFrontendServiceInfo {
+	if svc == nil {
+		return BridgeFrontendServiceInfo{}
+	}
+	caps := make([]string, 0, len(svc.capabilities))
+	for c := range svc.capabilities {
+		caps = append(caps, c)
+	}
+	return BridgeFrontendServiceInfo{
+		Platform:         svc.platform,
+		App:              svc.app,
+		Slot:             svc.slot,
+		Project:          svc.project,
+		Capabilities:     caps,
+		Metadata:         cloneBridgeMetadata(svc.metadata),
+		ConnectedClients: len(svc.clients),
+		RegisteredAt:     svc.registeredAt,
+		UpdatedAt:        svc.updatedAt,
+	}
+}
+
+func bridgeCapabilitiesMap(capabilities []string) map[string]bool {
+	caps := make(map[string]bool, len(capabilities)+1)
+	for _, c := range capabilities {
+		c = strings.TrimSpace(c)
+		if c != "" {
+			caps[c] = true
+		}
+	}
+	caps["text"] = true
+	return caps
+}
+
+func bridgeDefaultFrontendCapabilities() map[string]bool {
+	return bridgeCapabilitiesMap([]string{
+		"text",
+		"card",
+		"buttons",
+		"typing",
+		"update_message",
+		"preview",
+		"delete_message",
+		"reconstruct_reply",
+	})
+}
+
+func cloneBridgeCapabilities(input map[string]bool) map[string]bool {
+	if input == nil {
+		return nil
+	}
+	out := make(map[string]bool, len(input))
+	for k, v := range input {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneBridgeMetadata(input map[string]any) map[string]any {
+	if input == nil {
+		return nil
+	}
+	out := make(map[string]any, len(input))
+	for k, v := range input {
+		out[k] = v
+	}
+	return out
+}
+
+func bridgeRegisterLooksLikeFrontendClient(reg bridgeRegister) bool {
+	if strings.Contains(strings.TrimSpace(reg.Platform), "-tab-") {
+		return true
+	}
+	if reg.Metadata == nil {
+		return false
+	}
+	_, hasRoute := bridgeMetadataString(reg.Metadata, "route")
+	_, hasTransportSessionKey := bridgeMetadataString(reg.Metadata, "transport_session_key")
+	return hasRoute && hasTransportSessionKey
+}
+
+func bridgeFrontendConnectFromRegister(reg bridgeRegister) bridgeFrontendConnect {
+	route, _ := bridgeMetadataString(reg.Metadata, "route")
+	transportSessionKey, _ := bridgeMetadataString(reg.Metadata, "transport_session_key")
+	project, _ := bridgeMetadataString(reg.Metadata, "project")
+	slot, _ := bridgeMetadataString(reg.Metadata, "slot")
+	if slot == "" {
+		slot, _ = bridgeMetadataString(reg.Metadata, "frontend_slot")
+	}
+	return bridgeFrontendConnect{
+		Type:                "frontend_connect",
+		Platform:            reg.Platform,
+		Slot:                slot,
+		Route:               route,
+		TransportSessionKey: transportSessionKey,
+		Capabilities:        reg.Capabilities,
+		Project:             project,
+		Metadata:            reg.Metadata,
+	}
+}
+
+func bridgeFrontendServicePlatform(platform, slot, route, transportSessionKey, sessionKey string) string {
+	for _, candidate := range []string{
+		slot,
+		platform,
+		route,
+		bridgePlatformFromSessionKey(transportSessionKey),
+		bridgePlatformFromSessionKey(sessionKey),
+	} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" || strings.Contains(candidate, "-tab-") {
+			continue
+		}
+		return candidate
+	}
+	return ""
+}
+
+func bridgePlatformFromSessionKey(sessionKey string) string {
+	if idx := strings.Index(sessionKey, ":"); idx > 0 {
+		return sessionKey[:idx]
+	}
+	return ""
 }
 
 func bridgeMetadataStringListContains(metadata map[string]any, key, want string) bool {
@@ -1252,16 +1817,48 @@ func bridgeMetadataStringListContains(metadata map[string]any, key, want string)
 }
 
 func (bs *BridgeServer) platformFromSessionKey(sessionKey string) string {
+	sessionKey = strings.TrimSpace(sessionKey)
 	if idx := strings.Index(sessionKey, ":"); idx > 0 {
 		candidate := sessionKey[:idx]
 		bs.mu.RLock()
 		_, ok := bs.adapters[candidate]
+		if !ok {
+			_, ok = bs.frontendServices[candidate]
+		}
 		bs.mu.RUnlock()
 		if ok {
 			return candidate
 		}
 	}
-	return ""
+	bs.mu.RLock()
+	defer bs.mu.RUnlock()
+	return bridgeFrontendServicePlatformForSessionKeyLocked(bs.frontendServices, sessionKey)
+}
+
+func bridgeFrontendServicePlatformForSessionKeyLocked(services map[string]*bridgeFrontendService, sessionKey string) string {
+	if sessionKey == "" {
+		return ""
+	}
+	matchedPlatform := ""
+	for platform, svc := range services {
+		if svc == nil {
+			continue
+		}
+		for _, client := range svc.clients {
+			if client == nil {
+				continue
+			}
+			if client.sessionKey != sessionKey && client.transportSessionKey != sessionKey {
+				continue
+			}
+			if matchedPlatform != "" && matchedPlatform != platform {
+				return ""
+			}
+			matchedPlatform = platform
+			break
+		}
+	}
+	return matchedPlatform
 }
 
 // resolveEngine finds the engine to handle a message.
