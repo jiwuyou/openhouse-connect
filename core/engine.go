@@ -3287,9 +3287,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			} else if fullResponse == "" && len(textParts) > 0 {
 				fullResponse = strings.Join(textParts, "")
 			}
-			if fullResponse == "" {
+			var artifactRefs []artifactReference
+			fullResponse, artifactRefs = extractArtifactReferences(fullResponse)
+			if fullResponse == "" && len(artifactRefs) == 0 {
 				fullResponse = e.i18n.T(MsgEmptyResponse)
 			}
+			hasVisibleResponse := strings.TrimSpace(fullResponse) != ""
 
 			// Context usage indicator: prefer SDK tokens, fall back to self-reported.
 			sdkPlausible := event.InputTokens >= 100
@@ -3316,18 +3319,22 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 			}
 
-			session.AddHistory("assistant", baseResponse)
-			sessions.Save()
+			if baseResponse != "" {
+				session.AddHistory("assistant", baseResponse)
+				sessions.Save()
+			}
 
-			if e.showContextIndicator {
+			if hasVisibleResponse && e.showContextIndicator {
 				if sdkPlausible {
 					cleanResponse += contextIndicator(event.InputTokens)
 				} else if selfPct > 0 {
 					cleanResponse += fmt.Sprintf("\n[ctx: ~%d%%]", selfPct)
 				}
 			}
-			if footer := e.buildReplyFooter(replyAgent, state.agentSession, workspaceDir, replyFooterContextText(replyFooterSessionContextUsage(state.agentSession), e.i18n)); footer != "" {
-				cleanResponse = appendReplyFooter(cleanResponse, footer)
+			if hasVisibleResponse {
+				if footer := e.buildReplyFooter(replyAgent, state.agentSession, workspaceDir, replyFooterContextText(replyFooterSessionContextUsage(state.agentSession), e.i18n)); footer != "" {
+					cleanResponse = appendReplyFooter(cleanResponse, footer)
+				}
 			}
 			fullResponse = cleanResponse
 
@@ -3353,7 +3360,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// When tool calls happened and prior text was already surfaced in segments,
 			// only send the unsent remainder. When tool progress is hidden, tool events don't surface
 			// side-channel messages and segmentStart stays 0, so keep normal finalize flow.
-			if toolCount > 0 && segmentStart > 0 {
+			if !hasVisibleResponse {
+				sp.discard()
+			} else if toolCount > 0 && segmentStart > 0 {
 				sp.discard()
 				if segmentStart < len(textParts) {
 					unsent := strings.Join(textParts[segmentStart:], "")
@@ -3386,12 +3395,16 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 			}
 
+			if len(artifactRefs) > 0 {
+				e.deliverArtifactReferencesToState(e.ctx, state, artifactRefs)
+			}
+
 			if elapsed := time.Since(replyStart); elapsed >= slowPlatformSend {
 				slog.Warn("slow final reply send", "platform", p.Name(), "elapsed", elapsed, "response_len", len(fullResponse))
 			}
 
 			// TTS: async voice reply if enabled
-			if e.tts != nil && e.tts.Enabled && e.tts.TTS != nil {
+			if hasVisibleResponse && e.tts != nil && e.tts.Enabled && e.tts.TTS != nil {
 				state.mu.Lock()
 				fromVoice := state.fromVoice
 				state.mu.Unlock()

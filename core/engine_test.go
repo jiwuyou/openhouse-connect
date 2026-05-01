@@ -1559,8 +1559,78 @@ func TestAgentSystemPrompt_MentionsAttachmentSend(t *testing.T) {
 	if !strings.Contains(prompt, "$CC_CONNECT_OUTBOX") {
 		t.Fatalf("prompt missing outbox instructions: %q", prompt)
 	}
+	if !strings.Contains(prompt, "MEDIA:/absolute/path/to/image.png") {
+		t.Fatalf("prompt missing MEDIA tag fallback instructions: %q", prompt)
+	}
+	if !strings.Contains(prompt, "FILE:/absolute/path/to/report.pdf") {
+		t.Fatalf("prompt missing FILE tag fallback instructions: %q", prompt)
+	}
 	if !strings.Contains(prompt, "Do NOT manually add --project, --session, or --data-dir to cc-connect send") {
 		t.Fatalf("prompt should discourage manual targeting flags: %q", prompt)
+	}
+}
+
+func TestProcessInteractiveEvents_DeliversArtifactTags(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "chart.png")
+	if err := os.WriteFile(imagePath, []byte("\x89PNG\r\n\x1a\nimage"), 0o600); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "test:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s1")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-1",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventResult, Content: "图片已生成。\nMEDIA : " + imagePath, Done: true}
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
+
+	if got := p.getSent(); len(got) != 1 || got[0] != "图片已生成。" {
+		t.Fatalf("sent text = %#v, want tag-stripped reply", got)
+	}
+	images := p.getImages()
+	if len(images) != 1 {
+		t.Fatalf("images = %#v, want one delivered image", images)
+	}
+	if images[0].FileName != "chart.png" || images[0].MimeType != "image/png" {
+		t.Fatalf("image = %#v", images[0])
+	}
+}
+
+func TestProcessInteractiveEvents_DeliversTagOnlyArtifactWithoutEmptyReply(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "chart.png")
+	if err := os.WriteFile(imagePath, []byte("\x89PNG\r\n\x1a\nimage"), 0o600); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "test:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s1")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-1",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventResult, Content: "MEDIA:" + imagePath, Done: true}
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
+
+	if got := p.getSent(); len(got) != 0 {
+		t.Fatalf("sent text = %#v, want no empty text reply", got)
+	}
+	if images := p.getImages(); len(images) != 1 || images[0].FileName != "chart.png" {
+		t.Fatalf("images = %#v, want one delivered image", images)
 	}
 }
 

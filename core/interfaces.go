@@ -76,6 +76,12 @@ If CC_CONNECT_OUTBOX is set, files saved there are automatically delivered to th
 cc-connect injects CC_PROJECT, CC_SESSION_KEY, CC_SESSION_ID, CC_CONNECT_DATA_DIR, and, when available, CC_CONNECT_OUTBOX into your environment, so cc-connect send automatically targets the current project, session, and data directory.
 Do NOT manually add --project, --session, or --data-dir to cc-connect send for the current conversation.
 If you include --message, do not repeat the exact same sentence again in your normal reply, because your normal reply is also delivered automatically.
+If a tool creates the final image or file at another local path and you cannot move it into $CC_CONNECT_OUTBOX or run cc-connect send, include one machine-readable line in your final reply:
+
+  MEDIA:/absolute/path/to/image.png
+  FILE:/absolute/path/to/report.pdf
+
+cc-connect will try to deliver those tagged local paths as attachments and hide the tag lines from the user-facing text. Use absolute local paths only.
 
 ### Scheduled tasks (cron)
 When the user asks you to do something on a schedule (e.g. "每天早上6点帮我总结GitHub trending"), use the Bash tool to run:
