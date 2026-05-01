@@ -28,7 +28,7 @@ func (s *Server) storeSaveImage(img core.ImageAttachment) (store.AttachmentMeta,
 		FileName: meta.FileName,
 		MimeType: meta.MimeType,
 		Size:     meta.Size,
-		URL:      s.store.AttachmentURL(meta.ID),
+		URL:      s.attachmentURL(meta.ID),
 	}
 	return meta, att, nil
 }
@@ -55,7 +55,7 @@ func (s *Server) storeSaveFile(file core.FileAttachment) (store.AttachmentMeta, 
 		FileName: meta.FileName,
 		MimeType: meta.MimeType,
 		Size:     meta.Size,
-		URL:      s.store.AttachmentURL(meta.ID),
+		URL:      s.attachmentURL(meta.ID),
 	}
 	return meta, att, nil
 }
@@ -77,4 +77,3 @@ func extFromMime(mime string) string {
 		return fmt.Sprintf(".%s", strings.ReplaceAll(strings.ReplaceAll(mime, "/", "_"), "+", "_"))
 	}
 }
-

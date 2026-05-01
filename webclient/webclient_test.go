@@ -185,3 +185,91 @@ func TestPlatformSendImageAndAttachmentFetch(t *testing.T) {
 		t.Fatalf("attachment path=%q want prefix %q", path, wantPrefix)
 	}
 }
+
+func TestTokenAttachmentURLAllowsDirectFetch(t *testing.T) {
+	tmp := t.TempDir()
+	s, err := NewServer(Options{
+		Host:    "",
+		Port:    9831,
+		Token:   "t0k en+1",
+		DataDir: tmp,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	p := s.Platform("proj")
+	if err := p.Start(func(_ core.Platform, _ *core.Message) {}); err != nil {
+		t.Fatalf("platform.Start: %v", err)
+	}
+
+	rc := replyContext{Project: "proj", Session: "s1"}
+	imgData := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}
+	if err := p.(core.ImageSender).SendImage(context.Background(), rc, core.ImageAttachment{
+		MimeType: "image/png",
+		Data:     imgData,
+		FileName: "t.png",
+	}); err != nil {
+		t.Fatalf("SendImage: %v", err)
+	}
+
+	ts := httptest.NewServer(s.handler)
+	t.Cleanup(ts.Close)
+
+	// History API requires token.
+	res, err := ts.Client().Get(ts.URL + "/api/projects/proj/sessions/s1/messages?token=t0k+en%2B1")
+	if err != nil {
+		t.Fatalf("GET messages: %v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(res.Body)
+		t.Fatalf("GET status=%d body=%s", res.StatusCode, string(b))
+	}
+	var msgs []struct {
+		Attachments []struct {
+			URL string `json:"url"`
+		} `json:"attachments"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&msgs); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(msgs) != 1 || len(msgs[0].Attachments) != 1 {
+		t.Fatalf("unexpected message shape: %+v", msgs)
+	}
+	u := msgs[0].Attachments[0].URL
+	if !strings.Contains(u, "token=") {
+		t.Fatalf("attachment url missing token: %q", u)
+	}
+	if !strings.HasPrefix(u, "/attachments/") {
+		t.Fatalf("attachment url should be relative: %q", u)
+	}
+
+	// Attachment fetch should succeed without Authorization header because URL includes token.
+	res2, err := ts.Client().Get(ts.URL + u)
+	if err != nil {
+		t.Fatalf("GET attachment: %v", err)
+	}
+	defer res2.Body.Close()
+	b, _ := io.ReadAll(res2.Body)
+	if res2.StatusCode != http.StatusOK {
+		t.Fatalf("GET attachment status=%d body=%s", res2.StatusCode, string(b))
+	}
+	if !bytes.Equal(b, imgData) {
+		t.Fatalf("attachment bytes mismatch: got %x want %x", b, imgData)
+	}
+}
+
+func TestHostDefaultIsAllInterfaces(t *testing.T) {
+	tmp := t.TempDir()
+	s, err := NewServer(Options{
+		Host:    "",
+		Port:    9831,
+		DataDir: tmp,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if s.opts.Host != "" {
+		t.Fatalf("opts.Host=%q want empty (listen all)", s.opts.Host)
+	}
+}

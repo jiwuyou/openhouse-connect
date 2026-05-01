@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -47,6 +48,9 @@ type Server struct {
 	listener        net.Listener
 	projectHandlers map[string]core.MessageHandler
 	projectPlatforms map[string]*platform
+
+	// static serves the webclient UI when configured or embedded.
+	static http.Handler
 }
 
 func NewServer(opts Options) (*Server, error) {
@@ -56,9 +60,7 @@ func NewServer(opts Options) (*Server, error) {
 	if opts.Port < 0 {
 		return nil, fmt.Errorf("webclient: invalid port %d", opts.Port)
 	}
-	if strings.TrimSpace(opts.Host) == "" {
-		opts.Host = "127.0.0.1"
-	}
+	opts.Host = strings.TrimSpace(opts.Host) // empty means listen on all interfaces
 	if opts.Port == 0 {
 		opts.Port = 9830
 	}
@@ -76,6 +78,7 @@ func NewServer(opts Options) (*Server, error) {
 		events:          broker.NewHub(),
 		projectHandlers: make(map[string]core.MessageHandler),
 	}
+	s.static = s.defaultStaticHandler()
 	s.handler = s.newMux()
 	return s, nil
 }
@@ -153,23 +156,13 @@ func (s *Server) newMux() http.Handler {
 	mux.HandleFunc("GET /api/projects/{project}/sessions/{session}/events", s.wrap(s.handleEvents))
 	mux.HandleFunc("GET /attachments/{id}", s.wrap(s.handleGetAttachment))
 
-	// Root UI (minimal). If a local static directory exists, serve it.
-	if dir := filepath.Join("webclient", "ui", "static"); dirExists(dir) {
-		mux.Handle("GET /", http.FileServer(http.Dir(dir)))
-		mux.Handle("GET /assets/", http.StripPrefix("/", http.FileServer(http.Dir(dir))))
-	} else {
-		mux.HandleFunc("GET /", s.wrap(s.handleRoot))
-	}
+	// UI: either embedded/configured static FS, or a minimal placeholder page.
+	mux.HandleFunc("GET /", s.wrap(s.handleUI))
 
 	// CORS preflight
 	mux.HandleFunc("OPTIONS /{path...}", s.wrap(s.handleOptions))
 
 	return mux
-}
-
-func dirExists(dir string) bool {
-	st, err := os.Stat(dir)
-	return err == nil && st.IsDir()
 }
 
 func (s *Server) wrap(next http.HandlerFunc) http.HandlerFunc {
@@ -234,6 +227,17 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte("<!doctype html><html><head><meta charset=\"utf-8\"><title>openhouse-connect webclient</title></head><body><h1>openhouse-connect webclient</h1></body></html>"))
+}
+
+func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	h := s.static
+	s.mu.RUnlock()
+	if h == nil {
+		s.handleRoot(w, r)
+		return
+	}
+	h.ServeHTTP(w, r)
 }
 
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
@@ -422,4 +426,63 @@ func (s *Server) handleGetAttachment(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Disposition", fmt.Sprintf("%s; filename=%q", disp, meta.FileName))
 	}
 	http.ServeFile(w, r, path)
+}
+
+// SetStaticFS configures a static filesystem to be served at "/" (UI).
+// root is the subdirectory within fsys that should be treated as the web root.
+// If root is empty, fsys is treated as already rooted.
+func (s *Server) SetStaticFS(fsys fs.FS, root string) error {
+	h, err := staticHandlerFromFS(fsys, root)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.static = h
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Server) defaultStaticHandler() http.Handler {
+	fsys, root := embeddedStaticFS()
+	if fsys == nil {
+		return nil
+	}
+	h, err := staticHandlerFromFS(fsys, root)
+	if err != nil {
+		return nil
+	}
+	return h
+}
+
+func staticHandlerFromFS(fsys fs.FS, root string) (http.Handler, error) {
+	if fsys == nil {
+		return nil, nil
+	}
+	if strings.TrimSpace(root) != "" {
+		sub, err := fs.Sub(fsys, root)
+		if err != nil {
+			return nil, fmt.Errorf("webclient: static fs.Sub(%q): %w", root, err)
+		}
+		fsys = sub
+	}
+	return http.FileServer(http.FS(fsys)), nil
+}
+
+func (s *Server) attachmentURL(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	base := "/attachments/" + id
+	if s.opts.PublicURL != "" {
+		base = s.opts.PublicURL + base
+	}
+	if strings.TrimSpace(s.opts.Token) == "" {
+		return base
+	}
+	sep := "?"
+	if strings.Contains(base, "?") {
+		sep = "&"
+	}
+	return base + sep + "token=" + url.QueryEscape(s.opts.Token)
 }
