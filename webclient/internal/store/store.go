@@ -58,12 +58,21 @@ type Store struct {
 	publicURL   string
 	messagesDir string
 	attachDir   string
+	sessionsDir string
+	outboxDir   string
 
 	mu        sync.Mutex
 	sessLocks map[string]*sync.Mutex
 
 	attachMu sync.RWMutex
 	attach   map[string]AttachmentMeta
+
+	sessionsMu sync.Mutex
+
+	outboxMu sync.Mutex
+
+	liveMu sync.RWMutex
+	live   map[string]bool // key: project+"\n"+sessionID
 }
 
 func New(root string, publicURL string) (*Store, error) {
@@ -74,14 +83,23 @@ func New(root string, publicURL string) (*Store, error) {
 		publicURL:   publicURL,
 		messagesDir: filepath.Join(root, "messages"),
 		attachDir:   filepath.Join(root, "attachments"),
+		sessionsDir: filepath.Join(root, "sessions"),
+		outboxDir:   filepath.Join(root, "outbox"),
 		sessLocks:   make(map[string]*sync.Mutex),
 		attach:      make(map[string]AttachmentMeta),
+		live:        make(map[string]bool),
 	}
 	if err := os.MkdirAll(s.messagesDir, 0o755); err != nil {
 		return nil, fmt.Errorf("webclient store: mkdir messages: %w", err)
 	}
 	if err := os.MkdirAll(s.attachDir, 0o755); err != nil {
 		return nil, fmt.Errorf("webclient store: mkdir attachments: %w", err)
+	}
+	if err := os.MkdirAll(s.sessionsDir, 0o755); err != nil {
+		return nil, fmt.Errorf("webclient store: mkdir sessions: %w", err)
+	}
+	if err := os.MkdirAll(s.outboxDir, 0o755); err != nil {
+		return nil, fmt.Errorf("webclient store: mkdir outbox: %w", err)
 	}
 	if err := s.loadAttachmentIndex(); err != nil {
 		return nil, err
@@ -142,6 +160,10 @@ func (s *Store) AppendMessage(project, session string, msg Message) (Message, er
 	if _, err := f.Write(append(b, '\n')); err != nil {
 		return Message{}, fmt.Errorf("append message: %w", err)
 	}
+
+	// Best-effort: keep session metadata in sync for the admin-style UI.
+	// Message persistence (JSONL) remains the source of truth; meta can be rebuilt.
+	_ = s.noteSessionMessageLocked(project, session, msg)
 	return msg, nil
 }
 
@@ -403,4 +425,3 @@ func atomicWriteJSON(path string, v any) error {
 	}
 	return nil
 }
-

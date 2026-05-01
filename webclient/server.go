@@ -47,6 +47,7 @@ type Server struct {
 	store   *store.Store
 	events  *broker.Hub
 	handler http.Handler
+	root    string
 
 	mu               sync.RWMutex
 	started          bool
@@ -85,6 +86,7 @@ func NewServer(opts Options) (*Server, error) {
 		opts:            opts,
 		store:           st,
 		events:          broker.NewHub(),
+		root:            root,
 		projectHandlers: make(map[string]core.MessageHandler),
 	}
 	s.static = s.defaultStaticHandler()
@@ -105,34 +107,68 @@ func (s *Server) Platform(project string) core.Platform {
 
 func (s *Server) Start() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.started {
+		s.mu.Unlock()
 		return nil
 	}
 
 	addr := net.JoinHostPort(s.opts.Host, strconv.Itoa(s.opts.Port))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
+		s.mu.Unlock()
 		return fmt.Errorf("webclient: listen %s: %w", addr, err)
 	}
 
-	s.httpServer = &http.Server{
+	srv := &http.Server{
 		Addr:              addr,
 		Handler:           s.handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	s.httpServer = srv
 	s.listener = ln
 	s.started = true
+	s.mu.Unlock()
 
 	go func() {
-		err := s.httpServer.Serve(ln)
+		err := srv.Serve(ln)
 		if err == nil || errors.Is(err, http.ErrServerClosed) {
 			return
 		}
 		slog.Error("webclient: http server exited unexpectedly", "error", err)
 	}()
 
+	// Best-effort recovery: attempt due outbox items once at startup.
+	// This is intentionally minimal (no persistent goroutine); it provides
+	// a real recovery path after restart.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if n, err := s.recoverOutboxOnce(ctx, 50); err != nil {
+		slog.Warn("webclient: outbox recovery failed", "error", err)
+	} else if n > 0 {
+		slog.Info("webclient: outbox recovery attempted", "count", n)
+	}
+
 	return nil
+}
+
+// recoverOutboxOnce scans due outbox items and attempts delivery.
+// Tests may call this directly; Start also invokes it once.
+func (s *Server) recoverOutboxOnce(ctx context.Context, limit int) (int, error) {
+	items, err := s.store.ListOutboxDue(time.Now().UTC(), limit)
+	if err != nil {
+		return 0, err
+	}
+	attempted := 0
+	for _, item := range items {
+		attempted++
+		if err := s.deliverOutboxItem(ctx, item); err != nil {
+			// Minimal recovery: keep it immediately due so the next Start() can retry.
+			_, _ = s.store.MarkOutboxFailed(item.Project, item.ID, err.Error(), time.Now().UTC())
+			continue
+		}
+		_, _ = s.store.MarkOutboxSent(item.Project, item.ID)
+	}
+	return attempted, nil
 }
 
 func (s *Server) Stop(ctx context.Context) error {
@@ -172,6 +208,15 @@ func (s *Server) newMux() http.Handler {
 	mux.HandleFunc("GET /api/projects/{project}/sessions/{session}/events", s.wrap(s.handleEvents))
 	mux.HandleFunc("GET /attachments/{id}", s.wrap(s.handleGetAttachment))
 
+	// Client API facade for the copied management frontend served on 9840.
+	mux.HandleFunc("GET /api/v1/projects/{project}/sessions", s.wrap(s.handleV1ListSessions))
+	mux.HandleFunc("POST /api/v1/projects/{project}/sessions", s.wrap(s.handleV1CreateSession))
+	mux.HandleFunc("GET /api/v1/projects/{project}/sessions/{id}", s.wrap(s.handleV1GetSession))
+	mux.HandleFunc("PATCH /api/v1/projects/{project}/sessions/{id}", s.wrap(s.handleV1PatchSession))
+	mux.HandleFunc("DELETE /api/v1/projects/{project}/sessions/{id}", s.wrap(s.handleV1DeleteSession))
+	mux.HandleFunc("POST /api/v1/projects/{project}/sessions/switch", s.wrap(s.handleV1SwitchSession))
+	mux.HandleFunc("POST /api/v1/projects/{project}/send", s.wrap(s.handleV1Send))
+
 	// Management facade used by the copied web admin frontend served on 9840.
 	for _, method := range []string{
 		http.MethodGet,
@@ -183,6 +228,10 @@ func (s *Server) newMux() http.Handler {
 	} {
 		mux.HandleFunc(method+" /api/v1/{path...}", s.wrap(s.handleManagementProxy))
 	}
+	// /bridge/ws is the primary chat path used by the copied admin frontend.
+	// We intercept WebSocket upgrades so 9840 can persist chat history locally.
+	// Non-WebSocket requests (e.g. health checks) still proxy upstream.
+	mux.HandleFunc("GET /bridge/ws", s.handleBridgeWS)
 	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete, http.MethodOptions} {
 		mux.HandleFunc(method+" /bridge/{path...}", s.handleBridgeProxy)
 	}
