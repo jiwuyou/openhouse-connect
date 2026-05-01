@@ -20,6 +20,7 @@ import (
 	"github.com/chenhg5/cc-connect/config"
 	"github.com/chenhg5/cc-connect/core"
 	"github.com/chenhg5/cc-connect/daemon"
+	"github.com/chenhg5/cc-connect/webclient"
 	// Agent and platform imports are in separate plugin_*.go files
 	// controlled by build tags. See Makefile for selective compilation.
 )
@@ -183,11 +184,34 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Start built-in web client platform server if enabled.
+	// This is a first-class platform (like Feishu), not the Bridge frontend slot.
+	var webclientSrv *webclient.Server
+	if cfg.WebClient.Enabled != nil && *cfg.WebClient.Enabled {
+		opts := webclient.Options{
+			Host:      cfg.WebClient.Host,
+			Port:      cfg.WebClient.Port,
+			Token:     cfg.WebClient.Token,
+			DataDir:   cfg.WebClient.DataDir,
+			PublicURL: cfg.WebClient.PublicURL,
+		}
+		srv, err := webclient.NewServer(opts)
+		if err != nil {
+			slog.Error("webclient: create server failed", "error", err)
+			os.Exit(1)
+		}
+		if err := srv.Start(); err != nil {
+			slog.Error("webclient: server start failed", "error", err)
+			os.Exit(1)
+		}
+		webclientSrv = srv
+	}
+
 	projectRuntimes := make([]*projectRuntime, 0, len(cfg.Projects))
 	registeredProjects := make(map[string]struct{}, len(cfg.Projects))
 
 	for _, proj := range cfg.Projects {
-		runtime, err := buildProjectRuntime(cfg, proj, configPath, *observeFlag, *observeChannel)
+		runtime, err := buildProjectRuntime(cfg, proj, configPath, *observeFlag, *observeChannel, webclientSrv)
 		if err != nil {
 			slog.Error("failed to build project runtime", "project", proj.Name, "error", err)
 			os.Exit(1)
@@ -364,7 +388,7 @@ func main() {
 			if err != nil {
 				return "", false, err
 			}
-			if err := registerProjectRuntime(configPath, createdName, cfg, &projectRuntimes, registeredProjects, cronSched, heartbeatSched, bridgeSrv, webhookSrv, mgmtSrv, apiSrv, *observeFlag, *observeChannel); err != nil {
+			if err := registerProjectRuntime(configPath, createdName, cfg, &projectRuntimes, registeredProjects, cronSched, heartbeatSched, bridgeSrv, webhookSrv, mgmtSrv, apiSrv, webclientSrv, *observeFlag, *observeChannel); err != nil {
 				return createdName, false, err
 			}
 			return createdName, false, nil
@@ -527,6 +551,13 @@ func main() {
 	}
 	if webhookSrv != nil {
 		webhookSrv.Stop()
+	}
+	if webclientSrv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := webclientSrv.Stop(ctx); err != nil {
+			slog.Error("webclient: shutdown error", "error", err)
+		}
+		cancel()
 	}
 	heartbeatSched.Stop()
 	if cronSched != nil {
@@ -964,7 +995,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	return result, nil
 }
 
-func buildProjectRuntime(cfg *config.Config, proj config.ProjectConfig, configPath string, observeEnabled bool, observeChannel string) (*projectRuntime, error) {
+func buildProjectRuntime(cfg *config.Config, proj config.ProjectConfig, configPath string, observeEnabled bool, observeChannel string, webclientSrv *webclient.Server) (*projectRuntime, error) {
 	if proj.RunAsUser != "" {
 		if proj.Agent.Options == nil {
 			proj.Agent.Options = map[string]any{}
@@ -995,6 +1026,10 @@ func buildProjectRuntime(cfg *config.Config, proj config.ProjectConfig, configPa
 			return nil, fmt.Errorf("create platform %q: %w", pc.Type, err)
 		}
 		platforms = append(platforms, p)
+	}
+
+	if webclientSrv != nil {
+		platforms = append(platforms, webclientSrv.Platform(proj.Name))
 	}
 
 	workDir, _ := proj.Agent.Options["work_dir"].(string)
@@ -1377,7 +1412,7 @@ func buildProjectRuntime(cfg *config.Config, proj config.ProjectConfig, configPa
 	return &projectRuntime{project: proj, engine: engine, effectiveWorkDir: effectiveWorkDir}, nil
 }
 
-func registerProjectRuntime(configPath, projectName string, cfg *config.Config, projectRuntimes *[]*projectRuntime, registeredProjects map[string]struct{}, cronSched *core.CronScheduler, heartbeatSched *core.HeartbeatScheduler, bridgeSrv *core.BridgeServer, webhookSrv *core.WebhookServer, mgmtSrv *core.ManagementServer, apiSrv *core.APIServer, observeEnabled bool, observeChannel string) error {
+func registerProjectRuntime(configPath, projectName string, cfg *config.Config, projectRuntimes *[]*projectRuntime, registeredProjects map[string]struct{}, cronSched *core.CronScheduler, heartbeatSched *core.HeartbeatScheduler, bridgeSrv *core.BridgeServer, webhookSrv *core.WebhookServer, mgmtSrv *core.ManagementServer, apiSrv *core.APIServer, webclientSrv *webclient.Server, observeEnabled bool, observeChannel string) error {
 	if _, exists := registeredProjects[projectName]; exists {
 		return nil
 	}
@@ -1399,7 +1434,7 @@ func registerProjectRuntime(configPath, projectName string, cfg *config.Config, 
 		return fmt.Errorf("project %q not found after config save", projectName)
 	}
 
-	runtime, err := buildProjectRuntime(cfg, *proj, configPath, observeEnabled, observeChannel)
+	runtime, err := buildProjectRuntime(cfg, *proj, configPath, observeEnabled, observeChannel, webclientSrv)
 	if err != nil {
 		return err
 	}

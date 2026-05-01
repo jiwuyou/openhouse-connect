@@ -9,6 +9,7 @@ import (
 
 	"github.com/chenhg5/cc-connect/config"
 	"github.com/chenhg5/cc-connect/core"
+	"github.com/chenhg5/cc-connect/webclient"
 )
 
 type stubMainAgent struct {
@@ -162,7 +163,7 @@ func TestBuildProjectRuntimePassesDataDirToEngine(t *testing.T) {
 			Type:    agentName,
 			Options: map[string]any{"work_dir": workDir},
 		},
-	}, filepath.Join(t.TempDir(), "config.toml"), false, "")
+	}, filepath.Join(t.TempDir(), "config.toml"), false, "", (*webclient.Server)(nil))
 	if err != nil {
 		t.Fatalf("buildProjectRuntime() error = %v", err)
 	}

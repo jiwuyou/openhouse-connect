@@ -108,6 +108,7 @@ type Config struct {
 	Cron               CronConfig              `toml:"cron"`
 	Webhook            WebhookConfig           `toml:"webhook"`
 	Bridge             BridgeConfig            `toml:"bridge"`
+	WebClient          WebClientConfig         `toml:"webclient"`
 	Management         ManagementConfig        `toml:"management"`
 	IdleTimeoutMins    *int                    `toml:"idle_timeout_mins,omitempty"` // max minutes between agent events; 0 = no timeout; default 120
 }
@@ -134,6 +135,17 @@ type BridgeConfig struct {
 	Token       string   `toml:"token,omitempty"`        // shared secret for authentication; required
 	Path        string   `toml:"path,omitempty"`         // URL path; default "/bridge/ws"
 	CORSOrigins []string `toml:"cors_origins,omitempty"` // allowed CORS origins; empty = no CORS
+}
+
+// WebClientConfig controls the built-in web client platform server.
+// This is a first-class platform (like Feishu), not the Bridge frontend slot.
+type WebClientConfig struct {
+	Enabled   *bool  `toml:"enabled"`              // default false
+	Host      string `toml:"host,omitempty"`       // listen host; empty means all interfaces
+	Port      int    `toml:"port,omitempty"`       // listen port; default 9830
+	Token     string `toml:"token,omitempty"`      // shared secret for authentication (recommended)
+	PublicURL string `toml:"public_url,omitempty"` // optional: base URL for generating public attachment links
+	DataDir   string `toml:"data_dir,omitempty"`   // optional: storage directory; default inherits Config.DataDir
 }
 
 // ManagementConfig controls the HTTP Management API for external tools.
@@ -460,6 +472,14 @@ func applyConfigDefaults(cfg *Config) {
 	if strings.TrimSpace(cfg.Management.DefaultProjectBasePath) == "" {
 		cfg.Management.DefaultProjectBasePath = defaultProjectBasePath()
 	}
+
+	// WebClient defaults
+	if cfg.WebClient.Port <= 0 {
+		cfg.WebClient.Port = 9830
+	}
+	if strings.TrimSpace(cfg.WebClient.DataDir) == "" {
+		cfg.WebClient.DataDir = cfg.DataDir
+	}
 }
 
 func defaultProjectBasePath() string {
@@ -658,7 +678,8 @@ func (c *Config) validate() error {
 			return fmt.Errorf("config: %s.agent.type is required", prefix)
 		}
 		bridgeEnabled := c.Bridge.Enabled != nil && *c.Bridge.Enabled
-		if len(proj.Platforms) == 0 && !bridgeEnabled {
+		webclientEnabled := c.WebClient.Enabled != nil && *c.WebClient.Enabled
+		if len(proj.Platforms) == 0 && !bridgeEnabled && !webclientEnabled {
 			return fmt.Errorf("config: %s needs at least one [[projects.platforms]]", prefix)
 		}
 		for j, p := range proj.Platforms {

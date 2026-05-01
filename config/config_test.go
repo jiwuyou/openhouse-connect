@@ -76,6 +76,24 @@ func TestConfigValidate(t *testing.T) {
 			},
 		},
 		{
+			name: "allows webclient-only project with no platforms",
+			cfg: Config{
+				WebClient: WebClientConfig{
+					Enabled: func() *bool {
+						v := true
+						return &v
+					}(),
+				},
+				Projects: []ProjectConfig{
+					func() ProjectConfig {
+						p := validProject("demo")
+						p.Platforms = nil
+						return p
+					}(),
+				},
+			},
+		},
+		{
 			name: "requires platform type",
 			cfg: Config{
 				Projects: []ProjectConfig{
@@ -1319,6 +1337,37 @@ func TestLoad_ParsesAttachmentSendOff(t *testing.T) {
 	}
 	if cfg.AttachmentSend != "off" {
 		t.Fatalf("cfg.AttachmentSend = %q, want %q", cfg.AttachmentSend, "off")
+	}
+}
+
+func TestLoad_AppliesWebClientDefaults(t *testing.T) {
+	configPath := writeConfigFixture(t, `
+data_dir = "/tmp/cc-connect-test"
+
+[webclient]
+enabled = true
+token = "test-token"
+public_url = "http://localhost:9830"
+
+[[projects]]
+name = "demo"
+
+[projects.agent]
+type = "claudecode"
+
+[projects.agent.options]
+mode = "default"
+`)
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.WebClient.Port != 9830 {
+		t.Fatalf("cfg.WebClient.Port = %d, want %d", cfg.WebClient.Port, 9830)
+	}
+	if cfg.WebClient.DataDir != cfg.DataDir {
+		t.Fatalf("cfg.WebClient.DataDir = %q, want %q", cfg.WebClient.DataDir, cfg.DataDir)
 	}
 }
 
