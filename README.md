@@ -98,6 +98,12 @@ MiniMax-M2.7 is a next-generation large language model designed for autonomous e
 </p>
 
 <p align="center">
+  This project also places special emphasis on the <b>mobile web client experience</b>:<br/>
+  conversations should feel natural in a phone browser, with responsive layouts,<br/>
+  reliable image/file delivery, and web frontends designed for touch-first daily use.
+</p>
+
+<p align="center">
   <img src="docs/images/connector.png" alt="CC-Connect Architecture" width="90%"/>
 </p>
 
