@@ -1,6 +1,6 @@
 export const WEBNEW_BRIDGE_PLATFORM = 'webnew';
 export const DEFAULT_FRONTEND_SLOT = 'stable';
-export const FRONTEND_SLOT_OPTIONS = ['stable', 'beta', 'smallphone'];
+export const FRONTEND_SLOT_OPTIONS = ['stable', 'beta', 'web2', 'web3', 'web4', 'web5'];
 export const DEFAULT_WEB_BRIDGE_PLATFORM = DEFAULT_FRONTEND_SLOT;
 export const WEB_BRIDGE_PLATFORM_OPTIONS = FRONTEND_SLOT_OPTIONS;
 export const WEB_BRIDGE_USER_ID = 'web-admin';
@@ -15,11 +15,11 @@ export type FrontendSlotLike = {
 
 const STORAGE_KEY = 'cc_frontend_slot';
 const LEGACY_STORAGE_KEY = 'cc_web2_bridge_platform';
-const LEGACY_WEB_BRIDGE_PLATFORM_OPTIONS = ['web2', 'web3', 'web4', 'web5'];
+const LEGACY_WEB_BRIDGE_PLATFORM_OPTIONS: string[] = [];
 const FRONTEND_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,79}$/;
 
 function isLegacyWebRoute(value: string) {
-  return value === 'bridge' || value === 'web' || /^web[0-9][0-9a-z_-]*$/.test(value);
+  return value === 'bridge' || value === 'web';
 }
 
 export function normalizeWebBridgePlatform(value: string | null | undefined) {
