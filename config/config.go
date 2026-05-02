@@ -146,6 +146,25 @@ type WebClientConfig struct {
 	Token     string `toml:"token,omitempty"`      // shared secret for authentication (recommended)
 	PublicURL string `toml:"public_url,omitempty"` // optional: base URL for generating public attachment links
 	DataDir   string `toml:"data_dir,omitempty"`   // optional: storage directory; default inherits Config.DataDir
+
+	// Multi-app mode: a single HTTP server can host multiple chat apps.
+	// Each app has:
+	// - id: HTTP namespace (e.g. /apps/{id}/api/...)
+	// - platform: Bridge register platform (must be unique)
+	// - data_namespace: storage isolation namespace (must be a safe path segment)
+	//
+	// Legacy single-app mode (no apps): platform/data_namespace can be set on the root.
+	DefaultApp    string               `toml:"default_app,omitempty"`    // optional: default app id when Apps is non-empty
+	Platform      string               `toml:"platform,omitempty"`       // legacy: single-app platform name (default "webclient")
+	DataNamespace string               `toml:"data_namespace,omitempty"` // legacy: single-app storage namespace (default "__legacy__")
+	Apps          []WebClientAppConfig `toml:"apps,omitempty"`           // optional: multi-app registration
+}
+
+type WebClientAppConfig struct {
+	ID            string `toml:"id"`
+	Platform      string `toml:"platform"`
+	DataNamespace string `toml:"data_namespace"`
+	Enabled       *bool  `toml:"enabled,omitempty"` // nil defaults to true
 }
 
 // ManagementConfig controls the HTTP Management API for external tools.
@@ -480,6 +499,24 @@ func applyConfigDefaults(cfg *Config) {
 	if strings.TrimSpace(cfg.WebClient.DataDir) == "" {
 		cfg.WebClient.DataDir = cfg.DataDir
 	}
+	if strings.TrimSpace(cfg.WebClient.Platform) == "" {
+		cfg.WebClient.Platform = "webclient"
+	}
+	if strings.TrimSpace(cfg.WebClient.DataNamespace) == "" {
+		// Reserved for legacy single-app mode; multi-app stores are expected to
+		// use a dedicated apps/{data_namespace} subdir.
+		cfg.WebClient.DataNamespace = "__legacy__"
+	}
+	if len(cfg.WebClient.Apps) > 0 && strings.TrimSpace(cfg.WebClient.DefaultApp) == "" {
+		// If apps are configured and default_app is omitted, default to the
+		// first enabled app to keep the behavior deterministic.
+		for _, app := range cfg.WebClient.Apps {
+			if webClientAppEnabled(app.Enabled) {
+				cfg.WebClient.DefaultApp = strings.TrimSpace(app.ID)
+				break
+			}
+		}
+	}
 }
 
 func defaultProjectBasePath() string {
@@ -711,6 +748,106 @@ func (c *Config) validate() error {
 			return err
 		}
 	}
+	if err := validateWebClientConfig(c.WebClient); err != nil {
+		return err
+	}
+	return nil
+}
+
+var webClientDataNamespacePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+func webClientAppEnabled(v *bool) bool {
+	if v == nil {
+		return true
+	}
+	return *v
+}
+
+func validateWebClientConfig(wc WebClientConfig) error {
+	enabled := wc.Enabled != nil && *wc.Enabled
+	if !enabled {
+		return nil
+	}
+
+	// Legacy single-app mode: tolerate missing platform/data_namespace for
+	// backward compatibility, but validate them when set.
+	if len(wc.Apps) == 0 {
+		if ns := strings.TrimSpace(wc.DataNamespace); ns != "" && !webClientDataNamespacePattern.MatchString(ns) {
+			return fmt.Errorf("config: webclient.data_namespace %q is invalid (allowed: [A-Za-z0-9_-]{1,64})", ns)
+		}
+		return nil
+	}
+
+	seenID := map[string]struct{}{}
+	seenPlatform := map[string]struct{}{}
+	seenNS := map[string]struct{}{}
+
+	enabledCount := 0
+	for i, app := range wc.Apps {
+		if !webClientAppEnabled(app.Enabled) {
+			continue
+		}
+		enabledCount++
+
+		prefix := fmt.Sprintf("webclient.apps[%d]", i)
+		id := strings.TrimSpace(app.ID)
+		plat := strings.TrimSpace(app.Platform)
+		ns := strings.TrimSpace(app.DataNamespace)
+
+		if id == "" {
+			return fmt.Errorf("config: %s.id is required", prefix)
+		}
+		if plat == "" {
+			return fmt.Errorf("config: %s.platform is required", prefix)
+		}
+		if ns == "" {
+			return fmt.Errorf("config: %s.data_namespace is required", prefix)
+		}
+		if !webClientDataNamespacePattern.MatchString(id) {
+			return fmt.Errorf("config: %s.id %q is invalid (allowed: [A-Za-z0-9_-]{1,64})", prefix, id)
+		}
+		if !webClientDataNamespacePattern.MatchString(plat) {
+			return fmt.Errorf("config: %s.platform %q is invalid (allowed: [A-Za-z0-9_-]{1,64})", prefix, plat)
+		}
+		if !webClientDataNamespacePattern.MatchString(ns) {
+			return fmt.Errorf("config: %s.data_namespace %q is invalid (allowed: [A-Za-z0-9_-]{1,64})", prefix, ns)
+		}
+
+		if _, ok := seenID[id]; ok {
+			return fmt.Errorf("config: duplicate webclient app id %q", id)
+		}
+		seenID[id] = struct{}{}
+		if _, ok := seenPlatform[plat]; ok {
+			return fmt.Errorf("config: duplicate webclient app platform %q", plat)
+		}
+		seenPlatform[plat] = struct{}{}
+		if _, ok := seenNS[ns]; ok {
+			return fmt.Errorf("config: duplicate webclient app data_namespace %q", ns)
+		}
+		seenNS[ns] = struct{}{}
+	}
+
+	if enabledCount == 0 {
+		return fmt.Errorf("config: webclient.apps must include at least one enabled app when webclient.enabled is true")
+	}
+
+	if strings.TrimSpace(wc.DefaultApp) != "" {
+		want := strings.TrimSpace(wc.DefaultApp)
+		found := false
+		for _, app := range wc.Apps {
+			if !webClientAppEnabled(app.Enabled) {
+				continue
+			}
+			if strings.TrimSpace(app.ID) == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("config: webclient.default_app %q does not match any enabled webclient.apps[].id", want)
+		}
+	}
+
 	return nil
 }
 

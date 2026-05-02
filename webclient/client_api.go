@@ -34,6 +34,23 @@ func v1Error(w http.ResponseWriter, status int, msg string) {
 }
 
 func (s *Server) handleV1GetSettings(w http.ResponseWriter, r *http.Request) {
+	rt := s.defaultRuntime()
+	if rt == nil {
+		v1Error(w, http.StatusServiceUnavailable, "default app is not configured")
+		return
+	}
+	s.handleV1GetSettingsFor(rt, w, r)
+}
+
+func (s *Server) handleAppV1GetSettings(w http.ResponseWriter, r *http.Request) {
+	rt := s.requireAppRuntime(w, r)
+	if rt == nil {
+		return
+	}
+	s.handleV1GetSettingsFor(rt, w, r)
+}
+
+func (s *Server) handleV1GetSettingsFor(rt *appRuntime, w http.ResponseWriter, r *http.Request) {
 	env, status, err := s.mgmtDo(r.Context(), http.MethodGet, "/api/v1/settings", nil)
 	if err != nil || status < 200 || status >= 300 || !env.OK {
 		v1Error(w, http.StatusServiceUnavailable, "upstream settings unavailable")
@@ -44,7 +61,7 @@ func (s *Server) handleV1GetSettings(w http.ResponseWriter, r *http.Request) {
 		v1Error(w, http.StatusInternalServerError, "decode upstream settings failed")
 		return
 	}
-	local, err := s.store.GetWebClientSettings()
+	local, err := rt.store.GetWebClientSettings()
 	if err != nil {
 		v1Error(w, http.StatusInternalServerError, err.Error())
 		return
@@ -59,6 +76,23 @@ func (s *Server) handleV1GetSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleV1PatchSettings(w http.ResponseWriter, r *http.Request) {
+	rt := s.defaultRuntime()
+	if rt == nil {
+		v1Error(w, http.StatusServiceUnavailable, "default app is not configured")
+		return
+	}
+	s.handleV1PatchSettingsFor(rt, w, r)
+}
+
+func (s *Server) handleAppV1PatchSettings(w http.ResponseWriter, r *http.Request) {
+	rt := s.requireAppRuntime(w, r)
+	if rt == nil {
+		return
+	}
+	s.handleV1PatchSettingsFor(rt, w, r)
+}
+
+func (s *Server) handleV1PatchSettingsFor(rt *appRuntime, w http.ResponseWriter, r *http.Request) {
 	var updates map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
 		v1Error(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -86,7 +120,7 @@ func (s *Server) handleV1PatchSettings(w http.ResponseWriter, r *http.Request) {
 	delete(updates, "run_trace_mode")
 
 	if strings.TrimSpace(localMode) != "" {
-		if _, err := s.store.SetRunTraceMode(localMode); err != nil {
+		if _, err := rt.store.SetRunTraceMode(localMode); err != nil {
 			v1Error(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -113,7 +147,7 @@ func (s *Server) handleV1PatchSettings(w http.ResponseWriter, r *http.Request) {
 	if out == nil {
 		out = map[string]any{}
 	}
-	local, _ := s.store.GetWebClientSettings()
+	local, _ := rt.store.GetWebClientSettings()
 	out["webclient_display"] = map[string]any{
 		"run_trace_mode": local.WebClientDisplay.RunTraceMode,
 	}
@@ -161,13 +195,30 @@ type outboxPayloadV1CardAction struct {
 }
 
 func (s *Server) handleV1ListSessions(w http.ResponseWriter, r *http.Request) {
+	rt := s.defaultRuntime()
+	if rt == nil {
+		v1Error(w, http.StatusServiceUnavailable, "default app is not configured")
+		return
+	}
+	s.handleV1ListSessionsFor(rt, rt.attachmentURLLegacy, w, r)
+}
+
+func (s *Server) handleAppV1ListSessions(w http.ResponseWriter, r *http.Request) {
+	rt := s.requireAppRuntime(w, r)
+	if rt == nil {
+		return
+	}
+	s.handleV1ListSessionsFor(rt, rt.attachmentURLApp, w, r)
+}
+
+func (s *Server) handleV1ListSessionsFor(rt *appRuntime, urlFn func(id string) string, w http.ResponseWriter, r *http.Request) {
 	project := r.PathValue("project")
 	if err := store.ValidateSegment("project", project); err != nil {
 		v1Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	sessions, activeKeys, err := s.store.ListClientSessions(project)
+	sessions, activeKeys, err := rt.store.ListClientSessions(project)
 	if err != nil {
 		v1Error(w, http.StatusInternalServerError, err.Error())
 		return
@@ -186,6 +237,7 @@ func (s *Server) handleV1ListSessions(w http.ResponseWriter, r *http.Request) {
 
 		var last map[string]any
 		if meta.LastMessage != nil {
+			atts := rewriteAttachments(meta.LastMessage.Attachments, urlFn)
 			preview := meta.LastMessage.Content
 			if len(preview) > 200 {
 				preview = preview[:200]
@@ -195,10 +247,10 @@ func (s *Server) handleV1ListSessions(w http.ResponseWriter, r *http.Request) {
 				"content":   preview,
 				"timestamp": meta.LastMessage.Timestamp,
 			}
-			if imgs := v1ImagesFromAttachments(meta.LastMessage.Attachments); len(imgs) > 0 {
+			if imgs := v1ImagesFromAttachments(atts); len(imgs) > 0 {
 				last["images"] = imgs
 			}
-			if files := v1FilesFromAttachments(meta.LastMessage.Attachments); len(files) > 0 {
+			if files := v1FilesFromAttachments(atts); len(files) > 0 {
 				last["files"] = files
 			}
 			if !meta.LastMessage.Timestamp.IsZero() {
@@ -230,6 +282,23 @@ func (s *Server) handleV1ListSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleV1CreateSession(w http.ResponseWriter, r *http.Request) {
+	rt := s.defaultRuntime()
+	if rt == nil {
+		v1Error(w, http.StatusServiceUnavailable, "default app is not configured")
+		return
+	}
+	s.handleV1CreateSessionFor(rt, w, r)
+}
+
+func (s *Server) handleAppV1CreateSession(w http.ResponseWriter, r *http.Request) {
+	rt := s.requireAppRuntime(w, r)
+	if rt == nil {
+		return
+	}
+	s.handleV1CreateSessionFor(rt, w, r)
+}
+
+func (s *Server) handleV1CreateSessionFor(rt *appRuntime, w http.ResponseWriter, r *http.Request) {
 	project := r.PathValue("project")
 	if err := store.ValidateSegment("project", project); err != nil {
 		v1Error(w, http.StatusBadRequest, err.Error())
@@ -261,7 +330,7 @@ func (s *Server) handleV1CreateSession(w http.ResponseWriter, r *http.Request) {
 		updatedAt = now
 	}
 
-	meta, err := s.store.CreateClientSession(project, store.CreateClientSessionInput{
+	meta, err := rt.store.CreateClientSession(project, store.CreateClientSessionInput{
 		ID:         id,
 		SessionKey: sessionKey,
 		Name:       name,
@@ -287,6 +356,23 @@ func (s *Server) handleV1CreateSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleV1GetSession(w http.ResponseWriter, r *http.Request) {
+	rt := s.defaultRuntime()
+	if rt == nil {
+		v1Error(w, http.StatusServiceUnavailable, "default app is not configured")
+		return
+	}
+	s.handleV1GetSessionFor(rt, rt.attachmentURLLegacy, w, r)
+}
+
+func (s *Server) handleAppV1GetSession(w http.ResponseWriter, r *http.Request) {
+	rt := s.requireAppRuntime(w, r)
+	if rt == nil {
+		return
+	}
+	s.handleV1GetSessionFor(rt, rt.attachmentURLApp, w, r)
+}
+
+func (s *Server) handleV1GetSessionFor(rt *appRuntime, urlFn func(id string) string, w http.ResponseWriter, r *http.Request) {
 	project := r.PathValue("project")
 	id := strings.TrimSpace(r.PathValue("id"))
 	if err := store.ValidateSegment("project", project); err != nil {
@@ -305,7 +391,7 @@ func (s *Server) handleV1GetSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	detail, err := s.store.GetClientSession(project, id, histLimit)
+	detail, err := rt.store.GetClientSession(project, id, histLimit)
 	if err != nil {
 		if err == store.ErrNotFound {
 			v1Error(w, http.StatusNotFound, "session not found")
@@ -316,7 +402,7 @@ func (s *Server) handleV1GetSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	agentType := s.bestEffortProjectAgentType(r.Context(), project)
-	activeID, _ := s.store.ActiveSessionID(project, detail.SessionKey)
+	activeID, _ := rt.store.ActiveSessionID(project, detail.SessionKey)
 
 	history := make([]map[string]any, 0, len(detail.History))
 	for i, m := range detail.History {
@@ -339,10 +425,11 @@ func (s *Server) handleV1GetSession(w http.ResponseWriter, r *http.Request) {
 			"timestamp":       m.Timestamp,
 			"created_at":      m.Timestamp,
 		}
-		if imgs := v1ImagesFromAttachments(m.Attachments); len(imgs) > 0 {
+		atts := rewriteAttachments(m.Attachments, urlFn)
+		if imgs := v1ImagesFromAttachments(atts); len(imgs) > 0 {
 			entry["images"] = imgs
 		}
-		if files := v1FilesFromAttachments(m.Attachments); len(files) > 0 {
+		if files := v1FilesFromAttachments(atts); len(files) > 0 {
 			entry["files"] = files
 		}
 		history = append(history, entry)
@@ -356,7 +443,7 @@ func (s *Server) handleV1GetSession(w http.ResponseWriter, r *http.Request) {
 			runEventsLimit = n
 		}
 	}
-	runEventsRaw, _ := s.store.ReadRunEvents(project, id, runEventsLimit)
+	runEventsRaw, _ := rt.store.ReadRunEvents(project, id, runEventsLimit)
 	runEvents := make([]map[string]any, 0, len(runEventsRaw))
 	for i, ev := range runEventsRaw {
 		seq := ev.Seq
@@ -389,6 +476,7 @@ func (s *Server) handleV1GetSession(w http.ResponseWriter, r *http.Request) {
 
 	var last map[string]any
 	if detail.LastMessage != nil {
+		atts := rewriteAttachments(detail.LastMessage.Attachments, urlFn)
 		preview := detail.LastMessage.Content
 		if len(preview) > 200 {
 			preview = preview[:200]
@@ -398,10 +486,10 @@ func (s *Server) handleV1GetSession(w http.ResponseWriter, r *http.Request) {
 			"content":   preview,
 			"timestamp": detail.LastMessage.Timestamp,
 		}
-		if imgs := v1ImagesFromAttachments(detail.LastMessage.Attachments); len(imgs) > 0 {
+		if imgs := v1ImagesFromAttachments(atts); len(imgs) > 0 {
 			last["images"] = imgs
 		}
-		if files := v1FilesFromAttachments(detail.LastMessage.Attachments); len(files) > 0 {
+		if files := v1FilesFromAttachments(atts); len(files) > 0 {
 			last["files"] = files
 		}
 	}
@@ -427,6 +515,23 @@ func (s *Server) handleV1GetSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleV1PatchSession(w http.ResponseWriter, r *http.Request) {
+	rt := s.defaultRuntime()
+	if rt == nil {
+		v1Error(w, http.StatusServiceUnavailable, "default app is not configured")
+		return
+	}
+	s.handleV1PatchSessionFor(rt, w, r)
+}
+
+func (s *Server) handleAppV1PatchSession(w http.ResponseWriter, r *http.Request) {
+	rt := s.requireAppRuntime(w, r)
+	if rt == nil {
+		return
+	}
+	s.handleV1PatchSessionFor(rt, w, r)
+}
+
+func (s *Server) handleV1PatchSessionFor(rt *appRuntime, w http.ResponseWriter, r *http.Request) {
 	project := r.PathValue("project")
 	id := strings.TrimSpace(r.PathValue("id"))
 	if err := store.ValidateSegment("project", project); err != nil {
@@ -451,7 +556,7 @@ func (s *Server) handleV1PatchSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := s.store.RenameClientSession(project, id, name); err != nil {
+	if _, err := rt.store.RenameClientSession(project, id, name); err != nil {
 		if err == store.ErrNotFound {
 			v1Error(w, http.StatusNotFound, "session not found")
 			return
@@ -467,6 +572,23 @@ func (s *Server) handleV1PatchSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleV1DeleteSession(w http.ResponseWriter, r *http.Request) {
+	rt := s.defaultRuntime()
+	if rt == nil {
+		v1Error(w, http.StatusServiceUnavailable, "default app is not configured")
+		return
+	}
+	s.handleV1DeleteSessionFor(rt, w, r)
+}
+
+func (s *Server) handleAppV1DeleteSession(w http.ResponseWriter, r *http.Request) {
+	rt := s.requireAppRuntime(w, r)
+	if rt == nil {
+		return
+	}
+	s.handleV1DeleteSessionFor(rt, w, r)
+}
+
+func (s *Server) handleV1DeleteSessionFor(rt *appRuntime, w http.ResponseWriter, r *http.Request) {
 	project := r.PathValue("project")
 	id := strings.TrimSpace(r.PathValue("id"))
 	if err := store.ValidateSegment("project", project); err != nil {
@@ -479,7 +601,7 @@ func (s *Server) handleV1DeleteSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = s.tryDeleteUpstreamSession(r.Context(), project, id)
-	if err := s.store.DeleteClientSession(project, id); err != nil {
+	if err := rt.store.DeleteClientSession(project, id); err != nil {
 		v1Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -487,6 +609,23 @@ func (s *Server) handleV1DeleteSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleV1SwitchSession(w http.ResponseWriter, r *http.Request) {
+	rt := s.defaultRuntime()
+	if rt == nil {
+		v1Error(w, http.StatusServiceUnavailable, "default app is not configured")
+		return
+	}
+	s.handleV1SwitchSessionFor(rt, w, r)
+}
+
+func (s *Server) handleAppV1SwitchSession(w http.ResponseWriter, r *http.Request) {
+	rt := s.requireAppRuntime(w, r)
+	if rt == nil {
+		return
+	}
+	s.handleV1SwitchSessionFor(rt, w, r)
+}
+
+func (s *Server) handleV1SwitchSessionFor(rt *appRuntime, w http.ResponseWriter, r *http.Request) {
 	project := r.PathValue("project")
 	if err := store.ValidateSegment("project", project); err != nil {
 		v1Error(w, http.StatusBadRequest, err.Error())
@@ -513,7 +652,7 @@ func (s *Server) handleV1SwitchSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = s.trySwitchUpstreamSession(r.Context(), project, body.SessionKey, body.SessionID)
-	if err := s.store.SetActiveSession(project, body.SessionKey, body.SessionID); err != nil {
+	if err := rt.store.SetActiveSession(project, body.SessionKey, body.SessionID); err != nil {
 		v1Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -527,6 +666,23 @@ func (s *Server) handleV1SwitchSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleV1Send(w http.ResponseWriter, r *http.Request) {
+	rt := s.defaultRuntime()
+	if rt == nil {
+		v1Error(w, http.StatusServiceUnavailable, "default app is not configured")
+		return
+	}
+	s.handleV1SendFor(rt, rt.attachmentURLLegacy, w, r)
+}
+
+func (s *Server) handleAppV1Send(w http.ResponseWriter, r *http.Request) {
+	rt := s.requireAppRuntime(w, r)
+	if rt == nil {
+		return
+	}
+	s.handleV1SendFor(rt, rt.attachmentURLApp, w, r)
+}
+
+func (s *Server) handleV1SendFor(rt *appRuntime, urlFn func(id string) string, w http.ResponseWriter, r *http.Request) {
 	project := r.PathValue("project")
 	if err := store.ValidateSegment("project", project); err != nil {
 		v1Error(w, http.StatusBadRequest, err.Error())
@@ -562,7 +718,7 @@ func (s *Server) handleV1Send(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve session_key when omitted but session_id is known.
 	if body.SessionKey == "" && body.SessionID != "" {
-		if det, err := s.store.GetClientSession(project, body.SessionID, 0); err == nil {
+		if det, err := rt.store.GetClientSession(project, body.SessionID, 0); err == nil {
 			body.SessionKey = strings.TrimSpace(det.SessionKey)
 		}
 	}
@@ -573,7 +729,7 @@ func (s *Server) handleV1Send(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve session_id when omitted by older clients.
 	if body.SessionID == "" && body.SessionKey != "" {
-		if id, err := s.store.ActiveSessionID(project, body.SessionKey); err == nil && id != "" {
+		if id, err := rt.store.ActiveSessionID(project, body.SessionKey); err == nil && id != "" {
 			body.SessionID = id
 		}
 	}
@@ -587,7 +743,7 @@ func (s *Server) handleV1Send(w http.ResponseWriter, r *http.Request) {
 			name = "default"
 			createdAt = now
 		}
-		_, _ = s.store.CreateClientSession(project, store.CreateClientSessionInput{
+		_, _ = rt.store.CreateClientSession(project, store.CreateClientSessionInput{
 			ID:         id,
 			SessionKey: sessionKey,
 			Name:       name,
@@ -603,7 +759,7 @@ func (s *Server) handleV1Send(w http.ResponseWriter, r *http.Request) {
 	var coreImages []core.ImageAttachment
 	if !isAction {
 		for _, img := range body.Images {
-			att, coreAtt, err := s.persistIncomingImage(img)
+			att, coreAtt, err := s.persistIncomingImageFor(rt, urlFn, img)
 			if err != nil {
 				v1Error(w, http.StatusBadRequest, "invalid images: "+err.Error())
 				return
@@ -618,7 +774,7 @@ func (s *Server) handleV1Send(w http.ResponseWriter, r *http.Request) {
 	if isAction {
 		userContent = "[card_action] " + strings.TrimSpace(body.Action)
 	}
-	stored, err := s.store.AppendMessage(project, body.SessionID, store.Message{
+	stored, err := rt.store.AppendMessage(project, body.SessionID, store.Message{
 		ID:            userMsgID,
 		Role:          store.RoleUser,
 		Content:       userContent,
@@ -630,7 +786,7 @@ func (s *Server) handleV1Send(w http.ResponseWriter, r *http.Request) {
 		v1Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.events.Publish(project, body.SessionID, stored)
+	rt.events.Publish(project, body.SessionID, stored)
 
 	// Durable outbox record (persist before attempting delivery).
 	var payloadBytes []byte
@@ -655,7 +811,7 @@ func (s *Server) handleV1Send(w http.ResponseWriter, r *http.Request) {
 		v1Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	ob, err := s.store.CreateOutboxItem(store.CreateOutboxItemInput{
+	ob, err := rt.store.CreateOutboxItem(store.CreateOutboxItemInput{
 		ID:          userMsgID,
 		Project:     project,
 		SessionID:   body.SessionID,
@@ -668,25 +824,25 @@ func (s *Server) handleV1Send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.adapter != nil {
-		s.adapter.SetActiveRun(project, body.SessionKey, body.SessionID, userMsgID, userMsgID)
+	if rt.adapter != nil {
+		rt.adapter.SetActiveRun(project, body.SessionKey, body.SessionID, userMsgID, userMsgID)
 	}
 	var deliverErr error
 	if isAction {
-		deliverErr = s.deliverV1CardActionToUpstreamBridge(r.Context(), project, body.SessionKey, body.SessionID, body.Action, body.ReplyCtx)
+		deliverErr = rt.deliverV1CardActionToUpstreamBridge(r.Context(), project, body.SessionKey, body.SessionID, body.Action, body.ReplyCtx)
 	} else {
-		deliverErr = s.deliverV1SendToUpstreamBridge(r.Context(), project, body, ob.ID, coreImages)
+		deliverErr = rt.deliverV1SendToUpstreamBridge(r.Context(), project, body, ob.ID, coreImages)
 	}
 	if deliverErr != nil {
 		// Mark failed before returning error.
-		if _, markErr := s.store.MarkOutboxFailed(project, ob.ID, deliverErr.Error(), time.Now().UTC()); markErr != nil {
+		if _, markErr := rt.store.MarkOutboxFailed(project, ob.ID, deliverErr.Error(), time.Now().UTC()); markErr != nil {
 			v1Error(w, http.StatusInternalServerError, markErr.Error())
 			return
 		}
 		v1Error(w, http.StatusServiceUnavailable, deliverErr.Error())
 		return
 	}
-	if _, err := s.store.MarkOutboxSent(project, ob.ID); err != nil {
+	if _, err := rt.store.MarkOutboxSent(project, ob.ID); err != nil {
 		v1Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -702,7 +858,7 @@ func (s *Server) handleV1Send(w http.ResponseWriter, r *http.Request) {
 	v1JSON(w, http.StatusOK, data)
 }
 
-func (s *Server) deliverOutboxItem(ctx context.Context, item store.OutboxItem) error {
+func (rt *appRuntime) deliverOutboxItem(ctx context.Context, item store.OutboxItem) error {
 	if len(item.Payload) == 0 {
 		return fmt.Errorf("outbox payload is empty")
 	}
@@ -726,14 +882,14 @@ func (s *Server) deliverOutboxItem(ctx context.Context, item store.OutboxItem) e
 		if body.SessionKey == "" || body.SessionID == "" {
 			return fmt.Errorf("outbox payload is missing session_key or session_id")
 		}
-		coreImages, err := s.coreImagesFromAttachments(p.Attachments)
+		coreImages, err := rt.coreImagesFromAttachments(p.Attachments)
 		if err != nil {
 			return err
 		}
-		if s.adapter != nil {
-			s.adapter.SetActiveRun(item.Project, body.SessionKey, body.SessionID, item.ID, item.ID)
+		if rt.adapter != nil {
+			rt.adapter.SetActiveRun(item.Project, body.SessionKey, body.SessionID, item.ID, item.ID)
 		}
-		return s.deliverV1SendToUpstreamBridge(ctx, item.Project, body, item.ID, coreImages)
+		return rt.deliverV1SendToUpstreamBridge(ctx, item.Project, body, item.ID, coreImages)
 
 	case outboxPayloadKindV1CardAction:
 		var p outboxPayloadV1CardAction
@@ -747,17 +903,17 @@ func (s *Server) deliverOutboxItem(ctx context.Context, item store.OutboxItem) e
 		if sessionKey == "" || sessionID == "" || action == "" {
 			return fmt.Errorf("outbox payload is missing session_key/session_id/action")
 		}
-		if s.adapter != nil {
-			s.adapter.SetActiveRun(item.Project, sessionKey, sessionID, item.ID, item.ID)
+		if rt.adapter != nil {
+			rt.adapter.SetActiveRun(item.Project, sessionKey, sessionID, item.ID, item.ID)
 		}
-		return s.deliverV1CardActionToUpstreamBridge(ctx, item.Project, sessionKey, sessionID, action, replyCtx)
+		return rt.deliverV1CardActionToUpstreamBridge(ctx, item.Project, sessionKey, sessionID, action, replyCtx)
 
 	default:
 		return fmt.Errorf("unsupported outbox payload kind %q", strings.TrimSpace(kind.Kind))
 	}
 }
 
-func (s *Server) coreImagesFromAttachments(atts []store.Attachment) ([]core.ImageAttachment, error) {
+func (rt *appRuntime) coreImagesFromAttachments(atts []store.Attachment) ([]core.ImageAttachment, error) {
 	if len(atts) == 0 {
 		return nil, nil
 	}
@@ -769,7 +925,7 @@ func (s *Server) coreImagesFromAttachments(atts []store.Attachment) ([]core.Imag
 		if strings.TrimSpace(a.ID) == "" {
 			continue
 		}
-		meta, path, err := s.store.OpenAttachment(a.ID)
+		meta, path, err := rt.store.OpenAttachment(a.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -789,13 +945,13 @@ func (s *Server) coreImagesFromAttachments(atts []store.Attachment) ([]core.Imag
 	return out, nil
 }
 
-func (s *Server) deliverV1SendToUpstreamBridge(ctx context.Context, project string, body v1SendReq, msgID string, coreImages []core.ImageAttachment) error {
-	if s.adapter == nil {
+func (rt *appRuntime) deliverV1SendToUpstreamBridge(ctx context.Context, project string, body v1SendReq, msgID string, coreImages []core.ImageAttachment) error {
+	if rt.adapter == nil {
 		return fmt.Errorf("upstream bridge adapter is not configured")
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
-	if err := s.adapter.WaitConnected(waitCtx); err != nil {
+	if err := rt.adapter.WaitConnected(waitCtx); err != nil {
 		return fmt.Errorf("upstream bridge adapter not ready: %w", err)
 	}
 
@@ -806,19 +962,19 @@ func (s *Server) deliverV1SendToUpstreamBridge(ctx context.Context, project stri
 		}
 		wire = append(wire, base64EncodeImage(img.MimeType, img.Data, img.FileName))
 	}
-	return s.adapter.SendBridgeMessage(ctx, project, body, msgID, nil, wire)
+	return rt.adapter.SendBridgeMessage(ctx, project, body, msgID, nil, wire)
 }
 
-func (s *Server) deliverV1CardActionToUpstreamBridge(ctx context.Context, project, sessionKey, sessionID, action, replyCtx string) error {
-	if s.adapter == nil {
+func (rt *appRuntime) deliverV1CardActionToUpstreamBridge(ctx context.Context, project, sessionKey, sessionID, action, replyCtx string) error {
+	if rt.adapter == nil {
 		return fmt.Errorf("upstream bridge adapter is not configured")
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
-	if err := s.adapter.WaitConnected(waitCtx); err != nil {
+	if err := rt.adapter.WaitConnected(waitCtx); err != nil {
 		return fmt.Errorf("upstream bridge adapter not ready: %w", err)
 	}
-	return s.adapter.SendCardAction(ctx, project, sessionKey, sessionID, action, replyCtx)
+	return rt.adapter.SendCardAction(ctx, project, sessionKey, sessionID, action, replyCtx)
 }
 
 func (s *Server) fetchUpstreamBridgeConfig(ctx context.Context) (path string, token string, port int, err error) {
@@ -843,7 +999,7 @@ func (s *Server) fetchUpstreamBridgeConfig(ctx context.Context) (path string, to
 	return strings.TrimSpace(data.Bridge.Path), strings.TrimSpace(data.Bridge.Token), data.Bridge.Port, nil
 }
 
-func (s *Server) persistIncomingImage(img v1BridgeImage) (store.Attachment, core.ImageAttachment, error) {
+func (s *Server) persistIncomingImageFor(rt *appRuntime, urlFn func(id string) string, img v1BridgeImage) (store.Attachment, core.ImageAttachment, error) {
 	mime := strings.TrimSpace(img.MimeType)
 	if mime == "" {
 		mime = "image/png"
@@ -871,11 +1027,22 @@ func (s *Server) persistIncomingImage(img v1BridgeImage) (store.Attachment, core
 		Data:     decoded,
 		FileName: strings.TrimSpace(img.FileName),
 	}
-	_, att, err := s.storeSaveImage(coreImg)
+	_, att, err := rt.storeSaveImage(coreImg)
 	if err != nil {
 		return store.Attachment{}, core.ImageAttachment{}, err
 	}
+	if urlFn != nil && strings.TrimSpace(att.ID) != "" {
+		att.URL = urlFn(att.ID)
+	}
 	return att, coreImg, nil
+}
+
+func (s *Server) persistIncomingImage(img v1BridgeImage) (store.Attachment, core.ImageAttachment, error) {
+	rt := s.defaultRuntime()
+	if rt == nil {
+		return store.Attachment{}, core.ImageAttachment{}, fmt.Errorf("default app is not configured")
+	}
+	return s.persistIncomingImageFor(rt, rt.attachmentURLLegacy, img)
 }
 
 func stripDataURLPrefix(data string) string {

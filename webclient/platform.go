@@ -188,3 +188,161 @@ var _ core.Platform = (*platform)(nil)
 var _ core.ImageSender = (*platform)(nil)
 var _ core.FileSender = (*platform)(nil)
 var _ core.ReplyContextReconstructor = (*platform)(nil)
+
+// appPlatform is an app-scoped variant used by multi-app routes that need to
+// dispatch to an internal MessageHandler while keeping storage isolated.
+type appPlatform struct {
+	s       *Server
+	rt      *appRuntime
+	project string
+}
+
+func newAppPlatform(s *Server, rt *appRuntime, project string) *appPlatform {
+	return &appPlatform{s: s, rt: rt, project: strings.TrimSpace(project)}
+}
+
+func (p *appPlatform) Name() string {
+	if p == nil || p.rt == nil {
+		return "webclient"
+	}
+	if v := strings.TrimSpace(p.rt.platform); v != "" {
+		return v
+	}
+	return "webclient"
+}
+
+func (p *appPlatform) Start(handler core.MessageHandler) error {
+	// Internal handler registration remains keyed by project only. Multi-app
+	// deployments typically use the external adapter; appPlatform is used for
+	// correct reply persistence when a handler is present.
+	if p == nil || p.s == nil {
+		return fmt.Errorf("webclient: platform is nil")
+	}
+	project := strings.TrimSpace(p.project)
+	if err := store.ValidateSegment("project", project); err != nil {
+		return err
+	}
+	p.s.mu.Lock()
+	defer p.s.mu.Unlock()
+	p.s.projectHandlers[project] = handler
+	return nil
+}
+
+func (p *appPlatform) Stop() error {
+	if p == nil || p.s == nil {
+		return nil
+	}
+	project := strings.TrimSpace(p.project)
+	p.s.mu.Lock()
+	defer p.s.mu.Unlock()
+	delete(p.s.projectHandlers, project)
+	return nil
+}
+
+func (p *appPlatform) Reply(ctx context.Context, replyCtx any, content string) error {
+	return p.Send(ctx, replyCtx, content)
+}
+
+func (p *appPlatform) Send(ctx context.Context, replyCtx any, content string) error {
+	if p == nil || p.rt == nil {
+		return fmt.Errorf("webclient: app platform is not configured")
+	}
+	rc, err := parseReplyCtx(replyCtx)
+	if err != nil {
+		return err
+	}
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil
+	}
+	msg := store.Message{
+		Role:    store.RoleAssistant,
+		Content: content,
+	}
+	stored, err := p.rt.store.AppendMessage(rc.Project, rc.Session, msg)
+	if err != nil {
+		return err
+	}
+	p.rt.events.Publish(rc.Project, rc.Session, stored)
+	return nil
+}
+
+func (p *appPlatform) SendImage(ctx context.Context, replyCtx any, img core.ImageAttachment) error {
+	if p == nil || p.rt == nil {
+		return fmt.Errorf("webclient: app platform is not configured")
+	}
+	rc, err := parseReplyCtx(replyCtx)
+	if err != nil {
+		return err
+	}
+	meta, att, err := p.rt.storeSaveImage(img)
+	if err != nil {
+		return err
+	}
+	msg := store.Message{
+		Role: store.RoleAssistant,
+		Attachments: []store.Attachment{
+			{
+				ID:       meta.ID,
+				Kind:     "image",
+				FileName: meta.FileName,
+				MimeType: meta.MimeType,
+				Size:     meta.Size,
+				URL:      att.URL,
+			},
+		},
+	}
+	stored, err := p.rt.store.AppendMessage(rc.Project, rc.Session, msg)
+	if err != nil {
+		return err
+	}
+	p.rt.events.Publish(rc.Project, rc.Session, stored)
+	return nil
+}
+
+func (p *appPlatform) SendFile(ctx context.Context, replyCtx any, file core.FileAttachment) error {
+	if p == nil || p.rt == nil {
+		return fmt.Errorf("webclient: app platform is not configured")
+	}
+	rc, err := parseReplyCtx(replyCtx)
+	if err != nil {
+		return err
+	}
+	meta, att, err := p.rt.storeSaveFile(file)
+	if err != nil {
+		return err
+	}
+	msg := store.Message{
+		Role: store.RoleAssistant,
+		Attachments: []store.Attachment{
+			{
+				ID:       meta.ID,
+				Kind:     "file",
+				FileName: meta.FileName,
+				MimeType: meta.MimeType,
+				Size:     meta.Size,
+				URL:      att.URL,
+			},
+		},
+	}
+	stored, err := p.rt.store.AppendMessage(rc.Project, rc.Session, msg)
+	if err != nil {
+		return err
+	}
+	p.rt.events.Publish(rc.Project, rc.Session, stored)
+	return nil
+}
+
+func (p *appPlatform) ReconstructReplyCtx(sessionKey string) (any, error) {
+	// For legacy-only cron/restore support.
+	project, session, err := parseSessionKey(sessionKey)
+	if err != nil {
+		return nil, err
+	}
+	return replyContext{Project: project, Session: session}, nil
+}
+
+var _ core.Platform = (*appPlatform)(nil)
+var _ core.ImageSender = (*appPlatform)(nil)
+var _ core.FileSender = (*appPlatform)(nil)
+var _ core.ReplyContextReconstructor = (*appPlatform)(nil)

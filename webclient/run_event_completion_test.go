@@ -13,7 +13,11 @@ func TestAdapter_PersistDurableAssistant_AppendsRunCompletedEvent(t *testing.T) 
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	c := newAdapterClient(s)
+	rt := s.defaultRuntime()
+	if rt == nil {
+		t.Fatalf("default runtime is nil")
+	}
+	c := newAdapterClient(s, rt)
 
 	project := "proj"
 	sessionKey := "webnew:web-admin:proj"
@@ -55,7 +59,11 @@ func TestAdapter_PersistDurableError_AppendsRunErrorEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	c := newAdapterClient(s)
+	rt := s.defaultRuntime()
+	if rt == nil {
+		t.Fatalf("default runtime is nil")
+	}
+	c := newAdapterClient(s, rt)
 
 	project := "proj"
 	sessionKey := "webnew:web-admin:proj"

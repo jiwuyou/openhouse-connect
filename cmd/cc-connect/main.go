@@ -199,15 +199,7 @@ func main() {
 			managementBaseURL = "http://" + net.JoinHostPort(localLoopbackHost(cfg.Management.Host), strconv.Itoa(managementPort))
 			managementToken = cfg.Management.Token
 		}
-		opts := webclient.Options{
-			Host:              cfg.WebClient.Host,
-			Port:              cfg.WebClient.Port,
-			Token:             cfg.WebClient.Token,
-			DataDir:           cfg.WebClient.DataDir,
-			PublicURL:         cfg.WebClient.PublicURL,
-			ManagementBaseURL: managementBaseURL,
-			ManagementToken:   managementToken,
-		}
+		opts := buildWebClientOptions(cfg, managementBaseURL, managementToken)
 		srv, err := webclient.NewServer(opts)
 		if err != nil {
 			slog.Error("webclient: create server failed", "error", err)
@@ -1682,6 +1674,42 @@ func derefInt(v *int) int {
 		return 0
 	}
 	return *v
+}
+
+func buildWebClientOptions(cfg *config.Config, managementBaseURL, managementToken string) webclient.Options {
+	opts := webclient.Options{
+		Host:              cfg.WebClient.Host,
+		Port:              cfg.WebClient.Port,
+		Token:             cfg.WebClient.Token,
+		DataDir:           cfg.WebClient.DataDir,
+		PublicURL:         cfg.WebClient.PublicURL,
+		Platform:          strings.TrimSpace(cfg.WebClient.Platform),
+		DataNamespace:     strings.TrimSpace(cfg.WebClient.DataNamespace),
+		ManagementBaseURL: managementBaseURL,
+		ManagementToken:   managementToken,
+	}
+
+	// Keep legacy behavior unchanged when Apps is not configured.
+	if len(cfg.WebClient.Apps) == 0 {
+		return opts
+	}
+
+	opts.DefaultApp = strings.TrimSpace(cfg.WebClient.DefaultApp)
+	opts.Apps = make([]webclient.AppOptions, 0, len(cfg.WebClient.Apps))
+	for _, a := range cfg.WebClient.Apps {
+		// Match config validation: disabled apps are ignored entirely.
+		if a.Enabled != nil && !*a.Enabled {
+			continue
+		}
+
+		opts.Apps = append(opts.Apps, webclient.AppOptions{
+			ID:            strings.TrimSpace(a.ID),
+			Platform:      strings.TrimSpace(a.Platform),
+			DataNamespace: strings.TrimSpace(a.DataNamespace),
+			Enabled:       a.Enabled,
+		})
+	}
+	return opts
 }
 
 func localLoopbackHost(host string) string {

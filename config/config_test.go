@@ -1369,6 +1369,205 @@ mode = "default"
 	if cfg.WebClient.DataDir != cfg.DataDir {
 		t.Fatalf("cfg.WebClient.DataDir = %q, want %q", cfg.WebClient.DataDir, cfg.DataDir)
 	}
+	if cfg.WebClient.Platform != "webclient" {
+		t.Fatalf("cfg.WebClient.Platform = %q, want %q", cfg.WebClient.Platform, "webclient")
+	}
+	if cfg.WebClient.DataNamespace != "__legacy__" {
+		t.Fatalf("cfg.WebClient.DataNamespace = %q, want %q", cfg.WebClient.DataNamespace, "__legacy__")
+	}
+}
+
+func TestLoad_WebClientMultiApp_DefaultAppPicksFirstEnabled(t *testing.T) {
+	configPath := writeConfigFixture(t, `
+data_dir = "/tmp/cc-connect-test"
+
+[webclient]
+enabled = true
+token = "test-token"
+
+[[webclient.apps]]
+id = "crm"
+platform = "web-crm"
+data_namespace = "tenant1-crm"
+
+[[webclient.apps]]
+id = "support"
+platform = "web-support"
+data_namespace = "tenant1-support"
+enabled = false
+
+`+baseConfigTOML+`
+`)
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.WebClient.DefaultApp != "crm" {
+		t.Fatalf("cfg.WebClient.DefaultApp = %q, want %q", cfg.WebClient.DefaultApp, "crm")
+	}
+}
+
+func TestLoad_WebClientMultiApp_DefaultAppMustReferToEnabledApp(t *testing.T) {
+	configPath := writeConfigFixture(t, `
+data_dir = "/tmp/cc-connect-test"
+
+[webclient]
+enabled = true
+token = "test-token"
+default_app = "support"
+
+[[webclient.apps]]
+id = "crm"
+platform = "web-crm"
+data_namespace = "tenant1-crm"
+
+[[webclient.apps]]
+id = "support"
+platform = "web-support"
+data_namespace = "tenant1-support"
+enabled = false
+
+`+baseConfigTOML+`
+`)
+
+	_, err := Load(configPath)
+	if err == nil {
+		t.Fatalf("Load returned nil error, want error")
+	}
+	if !strings.Contains(err.Error(), "webclient.default_app") {
+		t.Fatalf("error = %q, want contains %q", err.Error(), "webclient.default_app")
+	}
+}
+
+func TestLoad_WebClientMultiApp_RejectsDuplicateIDs(t *testing.T) {
+	configPath := writeConfigFixture(t, `
+data_dir = "/tmp/cc-connect-test"
+
+[webclient]
+enabled = true
+token = "test-token"
+
+[[webclient.apps]]
+id = "crm"
+platform = "web-crm"
+data_namespace = "tenant1-crm"
+
+[[webclient.apps]]
+id = "crm"
+platform = "web-crm-2"
+data_namespace = "tenant1-crm-2"
+
+`+baseConfigTOML+`
+`)
+
+	_, err := Load(configPath)
+	assertErrContains(t, err, "duplicate webclient app id")
+}
+
+func TestLoad_WebClientMultiApp_RejectsDuplicatePlatforms(t *testing.T) {
+	configPath := writeConfigFixture(t, `
+data_dir = "/tmp/cc-connect-test"
+
+[webclient]
+enabled = true
+token = "test-token"
+
+[[webclient.apps]]
+id = "crm"
+platform = "web-crm"
+data_namespace = "tenant1-crm"
+
+[[webclient.apps]]
+id = "support"
+platform = "web-crm"
+data_namespace = "tenant1-support"
+
+`+baseConfigTOML+`
+`)
+
+	_, err := Load(configPath)
+	assertErrContains(t, err, "duplicate webclient app platform")
+}
+
+func TestLoad_WebClientMultiApp_RejectsDuplicateDataNamespaces(t *testing.T) {
+	configPath := writeConfigFixture(t, `
+data_dir = "/tmp/cc-connect-test"
+
+[webclient]
+enabled = true
+token = "test-token"
+
+[[webclient.apps]]
+id = "crm"
+platform = "web-crm"
+data_namespace = "tenant1"
+
+[[webclient.apps]]
+id = "support"
+platform = "web-support"
+data_namespace = "tenant1"
+
+`+baseConfigTOML+`
+`)
+
+	_, err := Load(configPath)
+	assertErrContains(t, err, "duplicate webclient app data_namespace")
+}
+
+func TestLoad_WebClientMultiApp_RejectsInvalidDataNamespace(t *testing.T) {
+	configPath := writeConfigFixture(t, `
+data_dir = "/tmp/cc-connect-test"
+
+[webclient]
+enabled = true
+token = "test-token"
+
+[[webclient.apps]]
+id = "crm"
+platform = "web-crm"
+data_namespace = "../bad"
+
+`+baseConfigTOML+`
+`)
+
+	_, err := Load(configPath)
+	assertErrContains(t, err, "data_namespace")
+	assertErrContains(t, err, "invalid")
+}
+
+func TestLoad_WebClientMultiApp_RejectsInvalidIDAndPlatform(t *testing.T) {
+	tests := []struct {
+		name       string
+		id         string
+		platform   string
+		wantErrSub string
+	}{
+		{name: "id", id: "bad/app", platform: "web-crm", wantErrSub: ".id"},
+		{name: "platform", id: "crm", platform: "web.crm", wantErrSub: ".platform"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := writeConfigFixture(t, `
+data_dir = "/tmp/cc-connect-test"
+
+[webclient]
+enabled = true
+token = "test-token"
+
+[[webclient.apps]]
+id = "`+tt.id+`"
+platform = "`+tt.platform+`"
+data_namespace = "tenant1-crm"
+
+`+baseConfigTOML+`
+`)
+
+			_, err := Load(configPath)
+			assertErrContains(t, err, tt.wantErrSub)
+			assertErrContains(t, err, "invalid")
+		})
+	}
 }
 
 func validProject(name string) ProjectConfig {

@@ -10,12 +10,20 @@ import (
 )
 
 func (s *Server) storeSaveImage(img core.ImageAttachment) (store.AttachmentMeta, store.Attachment, error) {
+	rt := s.defaultRuntime()
+	if rt == nil {
+		return store.AttachmentMeta{}, store.Attachment{}, fmt.Errorf("webclient: default app is not configured")
+	}
+	return rt.storeSaveImage(img)
+}
+
+func (rt *appRuntime) storeSaveImage(img core.ImageAttachment) (store.AttachmentMeta, store.Attachment, error) {
 	mime := strings.TrimSpace(img.MimeType)
 	name := strings.TrimSpace(img.FileName)
 	if name == "" {
 		name = "image" + extFromMime(mime)
 	}
-	meta, err := s.store.SaveAttachment(store.AttachmentMeta{
+	meta, err := rt.store.SaveAttachment(store.AttachmentMeta{
 		FileName: name,
 		MimeType: mime,
 	}, bytes.NewReader(img.Data))
@@ -28,12 +36,20 @@ func (s *Server) storeSaveImage(img core.ImageAttachment) (store.AttachmentMeta,
 		FileName: meta.FileName,
 		MimeType: meta.MimeType,
 		Size:     meta.Size,
-		URL:      s.attachmentURL(meta.ID),
+		URL:      rt.attachmentURLLegacy(meta.ID),
 	}
 	return meta, att, nil
 }
 
 func (s *Server) storeSaveFile(file core.FileAttachment) (store.AttachmentMeta, store.Attachment, error) {
+	rt := s.defaultRuntime()
+	if rt == nil {
+		return store.AttachmentMeta{}, store.Attachment{}, fmt.Errorf("webclient: default app is not configured")
+	}
+	return rt.storeSaveFile(file)
+}
+
+func (rt *appRuntime) storeSaveFile(file core.FileAttachment) (store.AttachmentMeta, store.Attachment, error) {
 	mime := strings.TrimSpace(file.MimeType)
 	if mime == "" {
 		mime = "application/octet-stream"
@@ -42,7 +58,7 @@ func (s *Server) storeSaveFile(file core.FileAttachment) (store.AttachmentMeta, 
 	if name == "" {
 		name = "file"
 	}
-	meta, err := s.store.SaveAttachment(store.AttachmentMeta{
+	meta, err := rt.store.SaveAttachment(store.AttachmentMeta{
 		FileName: name,
 		MimeType: mime,
 	}, bytes.NewReader(file.Data))
@@ -55,7 +71,7 @@ func (s *Server) storeSaveFile(file core.FileAttachment) (store.AttachmentMeta, 
 		FileName: meta.FileName,
 		MimeType: meta.MimeType,
 		Size:     meta.Size,
-		URL:      s.attachmentURL(meta.ID),
+		URL:      rt.attachmentURLLegacy(meta.ID),
 	}
 	return meta, att, nil
 }

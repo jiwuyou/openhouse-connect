@@ -940,6 +940,14 @@ func (s *Server) persistBridgeAssistantEvent(project, typ string, r bridgeReply,
 }
 
 func (s *Server) persistBridgeReplyAttachments(typ string, r bridgeReply, rawJSON []byte) ([]store.Attachment, error) {
+	rt := s.defaultRuntime()
+	if rt == nil {
+		return nil, fmt.Errorf("webclient: default app is not configured")
+	}
+	return s.persistBridgeReplyAttachmentsForRuntime(rt, typ, r, rawJSON)
+}
+
+func (s *Server) persistBridgeReplyAttachmentsForRuntime(rt *appRuntime, typ string, r bridgeReply, rawJSON []byte) ([]store.Attachment, error) {
 	var imgAny any
 	if r.Images != nil {
 		imgAny = r.Images
@@ -977,7 +985,7 @@ func (s *Server) persistBridgeReplyAttachments(typ string, r bridgeReply, rawJSO
 		if err != nil {
 			return nil, fmt.Errorf("invalid image base64")
 		}
-		_, att, err := s.storeSaveImage(core.ImageAttachment{
+		_, att, err := rt.storeSaveImage(core.ImageAttachment{
 			MimeType: strings.TrimSpace(img.MimeType),
 			Data:     decoded,
 			FileName: strings.TrimSpace(img.FileName),
@@ -1006,7 +1014,7 @@ func (s *Server) persistBridgeReplyAttachments(typ string, r bridgeReply, rawJSO
 				if err != nil {
 					return nil, fmt.Errorf("invalid file base64")
 				}
-				_, att, err := s.storeSaveFile(core.FileAttachment{
+				_, att, err := rt.storeSaveFile(core.FileAttachment{
 					MimeType: strings.TrimSpace(f.MimeType),
 					Data:     b,
 					FileName: strings.TrimSpace(f.FileName),

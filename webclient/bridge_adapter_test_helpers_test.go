@@ -13,10 +13,11 @@ import (
 )
 
 type fakeBridge struct {
-	Server *httptest.Server
-	Port   int
-	Token  string
-	Got    chan map[string]any
+	Server      *httptest.Server
+	Port        int
+	Token       string
+	Got         chan map[string]any
+	GotRegister chan map[string]any
 }
 
 func startFakeBridge(t *testing.T, token string) *fakeBridge {
@@ -25,6 +26,7 @@ func startFakeBridge(t *testing.T, token string) *fakeBridge {
 		token = "bridge-secret"
 	}
 	got := make(chan map[string]any, 32)
+	gotReg := make(chan map[string]any, 8)
 
 	up := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -49,6 +51,10 @@ func startFakeBridge(t *testing.T, token string) *fakeBridge {
 			}
 			var reg map[string]any
 			_ = json.Unmarshal(raw, &reg)
+			select {
+			case gotReg <- reg:
+			default:
+			}
 			_ = conn.WriteJSON(map[string]any{"type": "register_ack", "ok": true})
 
 			for {
@@ -88,5 +94,5 @@ func startFakeBridge(t *testing.T, token string) *fakeBridge {
 			port = addr.Port
 		}
 	}
-	return &fakeBridge{Server: srv, Port: port, Token: token, Got: got}
+	return &fakeBridge{Server: srv, Port: port, Token: token, Got: got, GotRegister: gotReg}
 }

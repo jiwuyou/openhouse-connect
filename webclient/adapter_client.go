@@ -19,12 +19,13 @@ import (
 
 // adapterClient is a long-lived external Bridge adapter connection.
 //
-// It registers as platform=webclient, receives bridge outbound frames, persists
-// durable messages into the local store, persists transient progress into
-// run_events, and forwards user messages from /api/v1/projects/{project}/send
-// to the upstream bridge as "message" / "card_action".
+// It registers as a single Bridge platform (per app runtime), receives bridge
+// outbound frames, persists durable messages into the app-scoped store,
+// persists transient progress into run_events, and forwards user messages from
+// the v1 send facade to the upstream bridge as "message" / "card_action".
 type adapterClient struct {
 	srv *Server
+	rt  *appRuntime
 
 	started atomic.Bool
 	stopCh  chan struct{}
@@ -58,9 +59,10 @@ type runRef struct {
 	UpdatedAt     time.Time
 }
 
-func newAdapterClient(s *Server) *adapterClient {
+func newAdapterClient(s *Server, rt *appRuntime) *adapterClient {
 	return &adapterClient{
 		srv:            s,
+		rt:             rt,
 		stopCh:         make(chan struct{}),
 		doneCh:         make(chan struct{}),
 		readyCh:        make(chan struct{}),
@@ -121,6 +123,23 @@ func (c *adapterClient) isConnected() bool {
 	c.connMu.RLock()
 	defer c.connMu.RUnlock()
 	return c.conn != nil
+}
+
+func (c *adapterClient) appID() string {
+	if c == nil || c.rt == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.rt.appID)
+}
+
+func (c *adapterClient) platformName() string {
+	if c == nil || c.rt == nil {
+		return "webclient"
+	}
+	if v := strings.TrimSpace(c.rt.platform); v != "" {
+		return v
+	}
+	return "webclient"
 }
 
 func (c *adapterClient) setConn(conn *websocket.Conn) {
@@ -412,7 +431,7 @@ func (c *adapterClient) loop() {
 		backoff = 500 * time.Millisecond
 		c.setConn(conn)
 		c.readyOnce.Do(func() { close(c.readyCh) })
-		slog.Info("webclient: upstream bridge adapter connected", "platform", "webclient", "ws", info.wsURL)
+		slog.Info("webclient: upstream bridge adapter connected", "app", c.appID(), "platform", c.platformName(), "ws", info.wsURL)
 		c.startOutboxRecovery(conn)
 
 		// Run until disconnected.
@@ -443,7 +462,7 @@ func (c *adapterClient) loop() {
 		// Drop any unsent queued frames on disconnect. Durable retry lives in outbox.
 		c.failPendingSends(discErr)
 		c.clearConn()
-		slog.Warn("webclient: upstream bridge adapter disconnected; reconnecting", "platform", "webclient")
+		slog.Warn("webclient: upstream bridge adapter disconnected; reconnecting", "app", c.appID(), "platform", c.platformName())
 	}
 }
 
@@ -467,10 +486,10 @@ func (c *adapterClient) startOutboxRecovery(conn *websocket.Conn) {
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-			n, err := c.srv.recoverOutboxOnce(ctx, 50)
+			n, err := c.rt.recoverOutboxOnce(ctx, 50)
 			cancel()
 			if err != nil {
-				slog.Warn("webclient: outbox recovery loop failed", "error", err)
+				slog.Warn("webclient: outbox recovery loop failed", "app", c.appID(), "error", err)
 				time.Sleep(1 * time.Second)
 			}
 			if n > 0 {
@@ -496,11 +515,24 @@ func (c *adapterClient) startOutboxRecovery(conn *websocket.Conn) {
 func (c *adapterClient) register(conn *websocket.Conn) error {
 	reg := map[string]any{
 		"type":         "register",
-		"platform":     "webclient",
+		"platform":     c.platformName(),
 		"capabilities": []string{"text", "image", "file", "card", "buttons", "typing", "preview", "update_message", "delete_message", "reconstruct_reply"},
 		"metadata": map[string]any{
 			"client_kind": "webclient_backend",
 			"adapter":     "webclient_backend",
+			"app_id":      c.appID(),
+			"data_namespace": func() string {
+				if c.rt == nil {
+					return ""
+				}
+				return strings.TrimSpace(c.rt.dataNamespace)
+			}(),
+			"namespace": func() string {
+				if c.rt == nil {
+					return ""
+				}
+				return strings.TrimSpace(c.rt.dataNamespace)
+			}(), // legacy key
 		},
 	}
 	if err := conn.WriteJSON(reg); err != nil {
@@ -602,7 +634,7 @@ func (c *adapterClient) persistDurableError(raw []byte) error {
 	}
 	project := c.projectFor(sessionKey, sessionID)
 	if project == "" {
-		if p, ok := c.srv.bestEffortFindProjectForSession(sessionKey, sessionID); ok {
+		if p, ok := c.bestEffortFindProjectForSession(sessionKey, sessionID); ok {
 			project = p
 			c.TrackSession(project, sessionKey, sessionID)
 		}
@@ -613,7 +645,7 @@ func (c *adapterClient) persistDurableError(raw []byte) error {
 
 	run, ok := c.activeRunFor(sessionKey, sessionID)
 	if !ok || strings.TrimSpace(run.RunID) == "" {
-		if ref, ok2 := c.srv.bestEffortLastUserRun(project, sessionID); ok2 {
+		if ref, ok2 := c.bestEffortLastUserRun(project, sessionID); ok2 {
 			run = ref
 			c.SetActiveRun(project, sessionKey, sessionID, run.RunID, run.UserMessageID)
 		}
@@ -631,7 +663,7 @@ func (c *adapterClient) persistDurableError(raw []byte) error {
 		msg = "[error]"
 	}
 
-	stored, err := c.srv.store.AppendMessage(project, sessionID, store.Message{
+	stored, err := c.rt.store.AppendMessage(project, sessionID, store.Message{
 		Role:          store.RoleAssistant,
 		Content:       msg,
 		Timestamp:     nowUTC(),
@@ -641,7 +673,7 @@ func (c *adapterClient) persistDurableError(raw []byte) error {
 	if err != nil {
 		return err
 	}
-	c.srv.events.Publish(project, sessionID, stored)
+	c.rt.events.Publish(project, sessionID, stored)
 
 	if strings.TrimSpace(run.RunID) != "" {
 		rEv := store.RunEvent{
@@ -656,8 +688,8 @@ func (c *adapterClient) persistDurableError(raw []byte) error {
 				"code": strings.TrimSpace(ev.Code),
 			},
 		}
-		if sev, err := c.srv.store.AppendRunEvent(project, sessionID, rEv); err == nil {
-			c.srv.runEvts.Publish(project, sessionID, sev)
+		if sev, err := c.rt.store.AppendRunEvent(project, sessionID, rEv); err == nil {
+			c.rt.runEvts.Publish(project, sessionID, sev)
 		}
 	}
 	return nil
@@ -709,7 +741,7 @@ func (c *adapterClient) persistRunEvent(typ string, raw []byte) error {
 	project := c.projectFor(sessionKey, sessionID)
 	if project == "" {
 		// Best-effort fallback: scan store metas.
-		if p, ok := c.srv.bestEffortFindProjectForSession(sessionKey, sessionID); ok {
+		if p, ok := c.bestEffortFindProjectForSession(sessionKey, sessionID); ok {
 			project = p
 			c.TrackSession(project, sessionKey, sessionID)
 		}
@@ -720,7 +752,7 @@ func (c *adapterClient) persistRunEvent(typ string, raw []byte) error {
 
 	run, ok := c.activeRunFor(sessionKey, sessionID)
 	if !ok || strings.TrimSpace(run.RunID) == "" {
-		if ref, ok2 := c.srv.bestEffortLastUserRun(project, sessionID); ok2 {
+		if ref, ok2 := c.bestEffortLastUserRun(project, sessionID); ok2 {
 			run = ref
 			c.SetActiveRun(project, sessionKey, sessionID, run.RunID, run.UserMessageID)
 		}
@@ -778,9 +810,9 @@ func (c *adapterClient) persistRunEvent(typ string, raw []byte) error {
 		Timestamp:     nowUTC(),
 		Metadata:      metadata,
 	}
-	stored, err := c.srv.store.AppendRunEvent(project, sessionID, ev)
+	stored, err := c.rt.store.AppendRunEvent(project, sessionID, ev)
 	if err == nil {
-		c.srv.runEvts.Publish(project, sessionID, stored)
+		c.rt.runEvts.Publish(project, sessionID, stored)
 	}
 	return err
 }
@@ -797,7 +829,7 @@ func (c *adapterClient) persistDurableAssistant(typ string, raw []byte) error {
 	}
 	project := c.projectFor(sessionKey, sessionID)
 	if project == "" {
-		if p, ok := c.srv.bestEffortFindProjectForSession(sessionKey, sessionID); ok {
+		if p, ok := c.bestEffortFindProjectForSession(sessionKey, sessionID); ok {
 			project = p
 			c.TrackSession(project, sessionKey, sessionID)
 		}
@@ -808,13 +840,13 @@ func (c *adapterClient) persistDurableAssistant(typ string, raw []byte) error {
 
 	run, ok := c.activeRunFor(sessionKey, sessionID)
 	if !ok || strings.TrimSpace(run.RunID) == "" {
-		if ref, ok2 := c.srv.bestEffortLastUserRun(project, sessionID); ok2 {
+		if ref, ok2 := c.bestEffortLastUserRun(project, sessionID); ok2 {
 			run = ref
 			c.SetActiveRun(project, sessionKey, sessionID, run.RunID, run.UserMessageID)
 		}
 	}
 
-	atts, err := c.srv.persistBridgeReplyAttachments(typ, r, raw)
+	atts, err := c.srv.persistBridgeReplyAttachmentsForRuntime(c.rt, typ, r, raw)
 	if err != nil {
 		// Persist text even if attachments failed.
 		slog.Warn("webclient: persist attachments failed", "type", typ, "error", err)
@@ -847,11 +879,11 @@ func (c *adapterClient) persistDurableAssistant(typ string, raw []byte) error {
 		UserMessageID: strings.TrimSpace(run.UserMessageID),
 		Attachments:   atts,
 	}
-	stored, err := c.srv.store.AppendMessage(project, sessionID, msg)
+	stored, err := c.rt.store.AppendMessage(project, sessionID, msg)
 	if err != nil {
 		return err
 	}
-	c.srv.events.Publish(project, sessionID, stored)
+	c.rt.events.Publish(project, sessionID, stored)
 
 	// Terminal run_event so the UI can compute run completion from run_events.
 	if strings.TrimSpace(run.RunID) != "" {
@@ -867,8 +899,8 @@ func (c *adapterClient) persistDurableAssistant(typ string, raw []byte) error {
 				"final_type": typ,
 			},
 		}
-		if sev, err := c.srv.store.AppendRunEvent(project, sessionID, ev); err == nil {
-			c.srv.runEvts.Publish(project, sessionID, sev)
+		if sev, err := c.rt.store.AppendRunEvent(project, sessionID, ev); err == nil {
+			c.rt.runEvts.Publish(project, sessionID, sev)
 		}
 	}
 	return nil
@@ -881,4 +913,45 @@ func base64EncodeImage(mime string, data []byte, fileName string) bridgeImageDat
 		Data:     base64.StdEncoding.EncodeToString(data),
 		FileName: strings.TrimSpace(fileName),
 	}
+}
+
+func (c *adapterClient) bestEffortFindProjectForSession(sessionKey, sessionID string) (string, bool) {
+	if c == nil || c.rt == nil || c.rt.store == nil {
+		return "", false
+	}
+	project, ok, err := c.rt.store.FindProjectForClientSession(sessionKey, sessionID)
+	if err != nil || !ok {
+		return "", false
+	}
+	return strings.TrimSpace(project), true
+}
+
+func (c *adapterClient) bestEffortLastUserRun(project, sessionID string) (runRef, bool) {
+	if c == nil || c.rt == nil || c.rt.store == nil {
+		return runRef{}, false
+	}
+	msgs, err := c.rt.store.ReadMessages(project, sessionID)
+	if err != nil || len(msgs) == 0 {
+		return runRef{}, false
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := msgs[i]
+		if strings.TrimSpace(m.Role) != store.RoleUser {
+			continue
+		}
+		id := strings.TrimSpace(m.ID)
+		if id == "" {
+			continue
+		}
+		runID := strings.TrimSpace(m.RunID)
+		if runID == "" {
+			runID = id
+		}
+		userID := strings.TrimSpace(m.UserMessageID)
+		if userID == "" {
+			userID = id
+		}
+		return runRef{RunID: runID, UserMessageID: userID, UpdatedAt: m.Timestamp}, true
+	}
+	return runRef{}, false
 }
