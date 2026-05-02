@@ -328,7 +328,16 @@
     "default": "default",
     "idleTimeout": "Idle timeout (min)",
     "idleTimeoutHint": "Auto-stop agent after N minutes of inactivity; 0 = disabled",
+    "webclientDisplay": "Web client display",
+    "runTraceMode": "Run trace mode",
+    "runTraceModeHint": "Controls how run progress is shown in web chat",
+    "runTraceModeAuto": "Auto (hide after reply)",
+    "runTraceModeExpanded": "Expanded",
+    "runTraceModeCollapsed": "Collapsed",
+    "runTraceModeHidden": "Hidden",
     "display": "Display",
+    "deprecated": "Deprecated",
+    "displayDeprecatedHint": "These options control platform-side display via the management backend (config.toml [display]). Use Web client display for web chat.",
     "thinkingMaxLen": "Thinking max length",
     "thinkingMaxLenHint": "Max characters for thinking messages; 0 = no truncation",
     "toolMaxLen": "Tool max length",
@@ -345,6 +354,12 @@
     "rlWindowSecsHint": "Time window in seconds",
     "log": "Log",
     "logLevel": "Log level"
+  },
+  "runTrace": {
+    "title": "Run trace",
+    "active": "Running",
+    "done": "Done",
+    "error": "Error"
   },
   "globalProviders": {
     "title": "Providers",

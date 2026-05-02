@@ -1,13 +1,19 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Save, Loader2 } from 'lucide-react';
-import { Card, Button, Input } from '@/components/ui';
-import { getGlobalSettings, updateGlobalSettings, type GlobalSettings as GS } from '@/api/settings';
+import { Card, Button } from '@/components/ui';
+import { getGlobalSettings, updateGlobalSettings, type GlobalSettings as GS, type RunTraceMode } from '@/api/settings';
 import { cn } from '@/lib/utils';
 
 const LOG_LEVELS = ['debug', 'info', 'warn', 'error'];
 const ATTACHMENT_OPTS = ['', 'on', 'off'];
 const LANGUAGES = ['en', 'zh', 'zh-TW', 'ja', 'es'];
+const RUN_TRACE_MODES: { value: RunTraceMode; labelKey: string; fallback: string }[] = [
+  { value: 'auto', labelKey: 'settings.runTraceModeAuto', fallback: 'Auto (hide after reply)' },
+  { value: 'expanded', labelKey: 'settings.runTraceModeExpanded', fallback: 'Expanded' },
+  { value: 'collapsed', labelKey: 'settings.runTraceModeCollapsed', fallback: 'Collapsed' },
+  { value: 'hidden', labelKey: 'settings.runTraceModeHidden', fallback: 'Hidden' },
+];
 
 function Toggle({ value, onChange, label, hint }: { value: boolean; onChange: (v: boolean) => void; label: string; hint?: string }) {
   return (
@@ -70,6 +76,7 @@ export default function GlobalSettings() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState('');
+  const [runTraceShape, setRunTraceShape] = useState<'nested' | 'flat' | 'unknown'>('unknown');
 
   const [language, setLanguage] = useState('en');
   const [attachmentSend, setAttachmentSend] = useState('');
@@ -79,6 +86,7 @@ export default function GlobalSettings() {
   const [thinkingMaxLen, setThinkingMaxLen] = useState(300);
   const [toolMessages, setToolMessages] = useState(true);
   const [toolMaxLen, setToolMaxLen] = useState(500);
+  const [runTraceMode, setRunTraceMode] = useState<RunTraceMode>('auto');
   const [spEnabled, setSpEnabled] = useState(true);
   const [spInterval, setSpInterval] = useState(1500);
   const [rlMax, setRlMax] = useState(20);
@@ -96,6 +104,16 @@ export default function GlobalSettings() {
       setThinkingMaxLen(s.thinking_max_len ?? 300);
       setToolMessages(s.tool_messages ?? true);
       setToolMaxLen(s.tool_max_len ?? 500);
+      if (s.webclient_display?.run_trace_mode) {
+        setRunTraceShape('nested');
+        setRunTraceMode(s.webclient_display.run_trace_mode);
+      } else if (s.run_trace_mode) {
+        setRunTraceShape('flat');
+        setRunTraceMode(s.run_trace_mode);
+      } else {
+        setRunTraceShape('unknown');
+        setRunTraceMode('auto');
+      }
       setSpEnabled(s.stream_preview_enabled ?? true);
       setSpInterval(s.stream_preview_interval_ms ?? 1500);
       setRlMax(s.rate_limit_max_messages ?? 20);
@@ -113,20 +131,31 @@ export default function GlobalSettings() {
     setSaving(true);
     setMsg('');
     try {
-      await updateGlobalSettings({
+      const patch: Partial<GS> = {
         language,
         attachment_send: attachmentSend,
         log_level: logLevel,
         idle_timeout_mins: idleTimeout,
-        thinking_messages: thinkingMessages,
-        thinking_max_len: thinkingMaxLen,
-        tool_messages: toolMessages,
-        tool_max_len: toolMaxLen,
         stream_preview_enabled: spEnabled,
         stream_preview_interval_ms: spInterval,
         rate_limit_max_messages: rlMax,
         rate_limit_window_secs: rlWindow,
-      });
+      };
+      // Keep existing fields intact but move them to the deprecated section.
+      // Still save them for compatibility with the management backend.
+      patch.thinking_messages = thinkingMessages;
+      patch.thinking_max_len = thinkingMaxLen;
+      patch.tool_messages = toolMessages;
+      patch.tool_max_len = toolMaxLen;
+
+      // Webclient-only preference; backend may accept either nested or flat form.
+      if (runTraceShape === 'flat') {
+        patch.run_trace_mode = runTraceMode;
+      } else {
+        patch.webclient_display = { run_trace_mode: runTraceMode };
+      }
+
+      await updateGlobalSettings(patch);
       setMsg(t('common.success'));
       setTimeout(() => setMsg(''), 3000);
     } catch (e: any) {
@@ -175,35 +204,16 @@ export default function GlobalSettings() {
         </div>
       </Card>
 
-      {/* Display */}
+      {/* Web client display */}
       <Card>
-        <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">{t('settings.display', 'Display')}</h3>
+        <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">{t('settings.webclientDisplay', 'Web client display')}</h3>
         <div className="space-y-4 max-w-lg">
-          <Toggle
-            label={t('settings.thinkingMessages', 'Thinking messages')}
-            value={thinkingMessages}
-            onChange={setThinkingMessages}
-            hint={t('settings.thinkingMessagesHint', 'Show or hide intermediate thinking messages')}
-          />
-          <NumberInput
-            label={t('settings.thinkingMaxLen', 'Thinking max length')}
-            value={thinkingMaxLen}
-            onChange={setThinkingMaxLen}
-            min={0}
-            hint={t('settings.thinkingMaxLenHint', 'Max characters for thinking messages; 0 = no truncation')}
-          />
-          <Toggle
-            label={t('settings.toolMessages', 'Tool progress')}
-            value={toolMessages}
-            onChange={setToolMessages}
-            hint={t('settings.toolMessagesHint', 'Show or hide tool progress messages')}
-          />
-          <NumberInput
-            label={t('settings.toolMaxLen', 'Tool max length')}
-            value={toolMaxLen}
-            onChange={setToolMaxLen}
-            min={0}
-            hint={t('settings.toolMaxLenHint', 'Max characters for tool use messages; 0 = no truncation')}
+          <Select
+            label={t('settings.runTraceMode', 'Run trace mode')}
+            value={runTraceMode}
+            onChange={(v) => setRunTraceMode(v as RunTraceMode)}
+            hint={t('settings.runTraceModeHint', 'Controls how run progress is shown in web chat')}
+            options={RUN_TRACE_MODES.map((m) => ({ value: m.value, label: t(m.labelKey, m.fallback) }))}
           />
         </div>
       </Card>
@@ -253,6 +263,47 @@ export default function GlobalSettings() {
             value={logLevel}
             onChange={setLogLevel}
             options={LOG_LEVELS.map((l) => ({ value: l, label: l }))}
+          />
+        </div>
+      </Card>
+
+      {/* Display (Deprecated) */}
+      <Card>
+        <div className="flex items-center justify-between gap-3 mb-1">
+          <h3 className="text-sm font-semibold text-gray-900 dark:text-white">{t('settings.display', 'Display')}</h3>
+          <span className="text-[10px] px-2 py-0.5 rounded-full bg-gray-100 dark:bg-gray-800 text-gray-500">
+            {t('settings.deprecated', 'Deprecated')}
+          </span>
+        </div>
+        <p className="text-[11px] text-gray-400 mb-4 max-w-2xl">
+          {t('settings.displayDeprecatedHint', 'These options control platform-side display via the management backend (config.toml [display]). Use Web client display for web chat.')}
+        </p>
+        <div className="space-y-4 max-w-lg">
+          <Toggle
+            label={t('settings.thinkingMessages', 'Thinking messages')}
+            value={thinkingMessages}
+            onChange={setThinkingMessages}
+            hint={t('settings.thinkingMessagesHint', 'Show or hide intermediate thinking messages')}
+          />
+          <NumberInput
+            label={t('settings.thinkingMaxLen', 'Thinking max length')}
+            value={thinkingMaxLen}
+            onChange={setThinkingMaxLen}
+            min={0}
+            hint={t('settings.thinkingMaxLenHint', 'Max characters for thinking messages; 0 = no truncation')}
+          />
+          <Toggle
+            label={t('settings.toolMessages', 'Tool progress')}
+            value={toolMessages}
+            onChange={setToolMessages}
+            hint={t('settings.toolMessagesHint', 'Show or hide tool progress messages')}
+          />
+          <NumberInput
+            label={t('settings.toolMaxLen', 'Tool max length')}
+            value={toolMaxLen}
+            onChange={setToolMaxLen}
+            min={0}
+            hint={t('settings.toolMaxLenHint', 'Max characters for tool use messages; 0 = no truncation')}
           />
         </div>
       </Card>

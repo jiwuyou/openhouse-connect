@@ -328,7 +328,16 @@
     "default": "predeterminado",
     "idleTimeout": "Tiempo de inactividad (min)",
     "idleTimeoutHint": "Detener agente automáticamente tras N minutos de inactividad; 0 = desactivado",
+    "webclientDisplay": "Visualización del cliente web",
+    "runTraceMode": "Modo de traza",
+    "runTraceModeHint": "Controla cómo se muestra el progreso en el chat web",
+    "runTraceModeAuto": "Auto (ocultar tras responder)",
+    "runTraceModeExpanded": "Expandido",
+    "runTraceModeCollapsed": "Contraído",
+    "runTraceModeHidden": "Oculto",
     "display": "Visualización",
+    "deprecated": "Obsoleto",
+    "displayDeprecatedHint": "Estas opciones controlan la visualización del lado de la plataforma a través del backend de gestión (config.toml [display]). Usa \"Visualización del cliente web\" para el chat web.",
     "thinkingMaxLen": "Longitud máx. de pensamiento",
     "thinkingMaxLenHint": "Caracteres máximos para mensajes de pensamiento; 0 = sin truncar",
     "toolMaxLen": "Longitud máx. de herramientas",
@@ -345,6 +354,12 @@
     "rlWindowSecsHint": "Ventana de tiempo en segundos",
     "log": "Registro",
     "logLevel": "Nivel de registro"
+  },
+  "runTrace": {
+    "title": "Traza de ejecución",
+    "active": "Ejecutando",
+    "done": "Hecho",
+    "error": "Error"
   },
   "globalProviders": {
     "title": "Gestión de proveedores",

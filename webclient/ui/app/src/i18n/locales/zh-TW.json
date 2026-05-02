@@ -328,7 +328,16 @@
     "default": "預設",
     "idleTimeout": "閒置逾時（分鐘）",
     "idleTimeoutHint": "Agent 閒置 N 分鐘後自動停止；0 = 不啟用",
+    "webclientDisplay": "網頁客戶端顯示",
+    "runTraceMode": "運行軌跡顯示模式",
+    "runTraceModeHint": "控制網頁對話中運行過程的顯示方式",
+    "runTraceModeAuto": "自動（回覆後隱藏）",
+    "runTraceModeExpanded": "全部展開",
+    "runTraceModeCollapsed": "收縮條",
+    "runTraceModeHidden": "全部隱藏",
     "display": "顯示",
+    "deprecated": "已棄用",
+    "displayDeprecatedHint": "這些選項屬於管理後端的平台側顯示設定（config.toml [display]）。網頁對話請使用「網頁客戶端顯示」。",
     "thinkingMaxLen": "思考最大長度",
     "thinkingMaxLenHint": "思考訊息的最大字元數；0 = 不截斷",
     "toolMaxLen": "工具最大長度",
@@ -345,6 +354,12 @@
     "rlWindowSecsHint": "時間視窗的秒數",
     "log": "記錄",
     "logLevel": "記錄層級"
+  },
+  "runTrace": {
+    "title": "運行軌跡",
+    "active": "運行中",
+    "done": "已完成",
+    "error": "錯誤"
   },
   "globalProviders": {
     "title": "服務商管理",

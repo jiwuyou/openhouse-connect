@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chenhg5/cc-connect/core"
 	"github.com/chenhg5/cc-connect/webclient/internal/store"
 )
 
@@ -80,34 +79,70 @@ func TestV1Send_UsesInternalStoreOutbox_Recovery(t *testing.T) {
 	}
 	outboxID := due[0].ID
 
-	// Second boot: register in-process handler and run one-shot recovery to deliver
-	// the due item, then ensure it is marked sent.
-	s2, err := NewServer(Options{DataDir: dataDir})
+	// Second boot: provide an upstream management + bridge so recovery can deliver.
+	bridge := startFakeBridge(t, "bridge-secret")
+	t.Cleanup(bridge.Server.Close)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok": true,
+				"data": map[string]any{
+					"bridge": map[string]any{
+						"enabled": true,
+						"port":    bridge.Port,
+						"path":    "/bridge/ws",
+						"token":   bridge.Token,
+					},
+				},
+			})
+			return
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"ok":false,"error":"not found"}`))
+			return
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	s2, err := NewServer(Options{
+		DataDir:           dataDir,
+		ManagementBaseURL: upstream.URL,
+		ManagementToken:   "mgmt-secret",
+	})
 	if err != nil {
 		t.Fatalf("NewServer(2): %v", err)
 	}
-
-	got := make(chan *core.Message, 1)
-	p := s2.Platform("proj")
-	if err := p.Start(func(_ core.Platform, msg *core.Message) {
-		got <- msg
-	}); err != nil {
-		t.Fatalf("platform.Start: %v", err)
+	if s2.adapter == nil {
+		t.Fatalf("expected adapter to be configured")
+	}
+	s2.adapter.Start()
+	t.Cleanup(s2.adapter.Stop)
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := s2.adapter.WaitConnected(ctx); err != nil {
+			t.Fatalf("adapter not connected: %v", err)
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if n, err := s2.recoverOutboxOnce(ctx, 10); err != nil {
 		t.Fatalf("recoverOutboxOnce: %v", err)
-	} else if n != 1 {
-		t.Fatalf("recover attempted=%d want 1", n)
+	} else if n != 0 && n != 1 {
+		// Adapter auto-recovery may deliver before this explicit attempt runs.
+		t.Fatalf("recover attempted=%d want 0 or 1", n)
 	}
 
 	select {
-	case <-got:
-		// ok
+	case msg := <-bridge.Got:
+		if msg["type"] != "message" {
+			t.Fatalf("bridge got type=%v", msg["type"])
+		}
 	case <-time.After(2 * time.Second):
-		t.Fatalf("timeout waiting for recovered send dispatch")
+		t.Fatalf("timeout waiting for recovered bridge dispatch")
 	}
 
 	item, err := s2.store.GetOutboxItem("proj", outboxID)

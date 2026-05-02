@@ -17,7 +17,6 @@ import (
 	"github.com/chenhg5/cc-connect/core"
 	"github.com/chenhg5/cc-connect/webclient/internal/store"
 	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
 )
 
 // v1JSON/v1Error mirror the management API envelope expected by the copied
@@ -34,6 +33,93 @@ func v1Error(w http.ResponseWriter, status int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": msg})
 }
 
+func (s *Server) handleV1GetSettings(w http.ResponseWriter, r *http.Request) {
+	env, status, err := s.mgmtDo(r.Context(), http.MethodGet, "/api/v1/settings", nil)
+	if err != nil || status < 200 || status >= 300 || !env.OK {
+		v1Error(w, http.StatusServiceUnavailable, "upstream settings unavailable")
+		return
+	}
+	var data map[string]any
+	if err := json.Unmarshal(env.Data, &data); err != nil {
+		v1Error(w, http.StatusInternalServerError, "decode upstream settings failed")
+		return
+	}
+	local, err := s.store.GetWebClientSettings()
+	if err != nil {
+		v1Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if data == nil {
+		data = map[string]any{}
+	}
+	data["webclient_display"] = map[string]any{
+		"run_trace_mode": local.WebClientDisplay.RunTraceMode,
+	}
+	v1JSON(w, http.StatusOK, data)
+}
+
+func (s *Server) handleV1PatchSettings(w http.ResponseWriter, r *http.Request) {
+	var updates map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
+		v1Error(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if updates == nil {
+		updates = map[string]any{}
+	}
+
+	// Extract local-only settings.
+	localMode := ""
+	if raw, ok := updates["webclient_display"]; ok {
+		if m, ok := raw.(map[string]any); ok {
+			if v, ok := m["run_trace_mode"].(string); ok {
+				localMode = v
+			}
+		}
+	}
+	if localMode == "" {
+		if v, ok := updates["run_trace_mode"].(string); ok {
+			localMode = v
+		}
+	}
+	delete(updates, "webclient_display")
+	delete(updates, "run_trace_mode")
+
+	if strings.TrimSpace(localMode) != "" {
+		if _, err := s.store.SetRunTraceMode(localMode); err != nil {
+			v1Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	// Forward remaining updates to upstream management settings.
+	var out map[string]any
+	if len(updates) > 0 {
+		env, status, err := s.mgmtDo(r.Context(), http.MethodPatch, "/api/v1/settings", updates)
+		if err != nil || status < 200 || status >= 300 || !env.OK {
+			v1Error(w, http.StatusBadGateway, "upstream settings save failed")
+			return
+		}
+		_ = json.Unmarshal(env.Data, &out)
+	} else {
+		// No upstream updates; fetch current upstream settings so we can return a merged view.
+		env, status, err := s.mgmtDo(r.Context(), http.MethodGet, "/api/v1/settings", nil)
+		if err != nil || status < 200 || status >= 300 || !env.OK {
+			v1Error(w, http.StatusBadGateway, "upstream settings fetch failed")
+			return
+		}
+		_ = json.Unmarshal(env.Data, &out)
+	}
+	if out == nil {
+		out = map[string]any{}
+	}
+	local, _ := s.store.GetWebClientSettings()
+	out["webclient_display"] = map[string]any{
+		"run_trace_mode": local.WebClientDisplay.RunTraceMode,
+	}
+	v1JSON(w, http.StatusOK, out)
+}
+
 type v1SessionReq struct {
 	SessionKey string `json:"session_key"`
 	Name       string `json:"name,omitempty"`
@@ -42,7 +128,9 @@ type v1SessionReq struct {
 type v1SendReq struct {
 	SessionKey string          `json:"session_key"`
 	SessionID  string          `json:"session_id,omitempty"`
-	Message    string          `json:"message"`
+	Message    string          `json:"message,omitempty"`
+	Action     string          `json:"action,omitempty"`
+	ReplyCtx   string          `json:"reply_ctx,omitempty"`
 	Images     []v1BridgeImage `json:"images,omitempty"`
 }
 
@@ -54,6 +142,7 @@ type v1BridgeImage struct {
 }
 
 const outboxPayloadKindV1Send = "v1_send"
+const outboxPayloadKindV1CardAction = "v1_card_action"
 
 type outboxPayloadV1Send struct {
 	Kind        string             `json:"kind"`
@@ -61,6 +150,14 @@ type outboxPayloadV1Send struct {
 	SessionID   string             `json:"session_id"`
 	Message     string             `json:"message,omitempty"`
 	Attachments []store.Attachment `json:"attachments,omitempty"`
+}
+
+type outboxPayloadV1CardAction struct {
+	Kind       string `json:"kind"`
+	SessionKey string `json:"session_key"`
+	SessionID  string `json:"session_id"`
+	Action     string `json:"action"`
+	ReplyCtx   string `json:"reply_ctx,omitempty"`
 }
 
 func (s *Server) handleV1ListSessions(w http.ResponseWriter, r *http.Request) {
@@ -222,11 +319,25 @@ func (s *Server) handleV1GetSession(w http.ResponseWriter, r *http.Request) {
 	activeID, _ := s.store.ActiveSessionID(project, detail.SessionKey)
 
 	history := make([]map[string]any, 0, len(detail.History))
-	for _, m := range detail.History {
+	for i, m := range detail.History {
+		seq := i + 1
+		runID := strings.TrimSpace(m.RunID)
+		userMsgID := strings.TrimSpace(m.UserMessageID)
+		if runID == "" {
+			runID = strings.TrimSpace(m.ID)
+		}
+		if userMsgID == "" {
+			userMsgID = strings.TrimSpace(m.ID)
+		}
 		entry := map[string]any{
-			"role":      m.Role,
-			"content":   m.Content,
-			"timestamp": m.Timestamp,
+			"id":              m.ID,
+			"seq":             seq,
+			"run_id":          runID,
+			"user_message_id": userMsgID,
+			"role":            m.Role,
+			"content":         m.Content,
+			"timestamp":       m.Timestamp,
+			"created_at":      m.Timestamp,
 		}
 		if imgs := v1ImagesFromAttachments(m.Attachments); len(imgs) > 0 {
 			entry["images"] = imgs
@@ -235,6 +346,37 @@ func (s *Server) handleV1GetSession(w http.ResponseWriter, r *http.Request) {
 			entry["files"] = files
 		}
 		history = append(history, entry)
+	}
+
+	// Attach run_events for optional "run trace" UI modes. These are not part of
+	// the durable history timeline and must never be treated as assistant messages.
+	runEventsLimit := 200
+	if v := r.URL.Query().Get("run_events_limit"); v != "" {
+		if n, err := strconvAtoiPositive(v); err == nil && n > 0 {
+			runEventsLimit = n
+		}
+	}
+	runEventsRaw, _ := s.store.ReadRunEvents(project, id, runEventsLimit)
+	runEvents := make([]map[string]any, 0, len(runEventsRaw))
+	for i, ev := range runEventsRaw {
+		seq := ev.Seq
+		if seq <= 0 {
+			seq = i + 1
+		}
+		entry := map[string]any{
+			"id":              ev.ID,
+			"seq":             seq,
+			"run_id":          ev.RunID,
+			"user_message_id": ev.UserMessageID,
+			"session_id":      ev.SessionID,
+			"type":            ev.Type,
+			"content":         ev.Content,
+			"status":          ev.Status,
+			"created_at":      ev.CreatedAt,
+			"timestamp":       firstNonEmptyTime(ev.Timestamp, ev.CreatedAt),
+			"metadata":        ev.Metadata,
+		}
+		runEvents = append(runEvents, entry)
 	}
 
 	updated := detail.UpdatedAt
@@ -280,6 +422,7 @@ func (s *Server) handleV1GetSession(w http.ResponseWriter, r *http.Request) {
 		"history_count":    detail.HistoryCount,
 		"last_message":     last,
 		"history":          history,
+		"run_events":       runEvents,
 	})
 }
 
@@ -398,12 +541,18 @@ func (s *Server) handleV1Send(w http.ResponseWriter, r *http.Request) {
 	body.SessionKey = strings.TrimSpace(body.SessionKey)
 	body.SessionID = strings.TrimSpace(body.SessionID)
 	body.Message = strings.TrimSpace(body.Message)
+	body.Action = strings.TrimSpace(body.Action)
+	body.ReplyCtx = strings.TrimSpace(body.ReplyCtx)
 	if body.SessionKey == "" && body.SessionID == "" {
 		v1Error(w, http.StatusBadRequest, "session_key or session_id is required")
 		return
 	}
-	if body.Message == "" && len(body.Images) == 0 {
+	if body.Message == "" && len(body.Images) == 0 && body.Action == "" {
 		v1Error(w, http.StatusBadRequest, "message or attachment is required")
+		return
+	}
+	if body.Action != "" && len(body.Images) > 0 {
+		v1Error(w, http.StatusBadRequest, "card_action cannot include images")
 		return
 	}
 	if len(body.Images) > 4 {
@@ -447,23 +596,35 @@ func (s *Server) handleV1Send(w http.ResponseWriter, r *http.Request) {
 		body.SessionID = id
 	}
 
+	isAction := strings.TrimSpace(body.Action) != ""
+
 	// Persist user message first (including image uploads saved as attachments).
 	var msgAttachments []store.Attachment
 	var coreImages []core.ImageAttachment
-	for _, img := range body.Images {
-		att, coreAtt, err := s.persistIncomingImage(img)
-		if err != nil {
-			v1Error(w, http.StatusBadRequest, "invalid images: "+err.Error())
-			return
+	if !isAction {
+		for _, img := range body.Images {
+			att, coreAtt, err := s.persistIncomingImage(img)
+			if err != nil {
+				v1Error(w, http.StatusBadRequest, "invalid images: "+err.Error())
+				return
+			}
+			msgAttachments = append(msgAttachments, att)
+			coreImages = append(coreImages, coreAtt)
 		}
-		msgAttachments = append(msgAttachments, att)
-		coreImages = append(coreImages, coreAtt)
 	}
 
+	userMsgID := uuid.NewString()
+	userContent := body.Message
+	if isAction {
+		userContent = "[card_action] " + strings.TrimSpace(body.Action)
+	}
 	stored, err := s.store.AppendMessage(project, body.SessionID, store.Message{
-		Role:        store.RoleUser,
-		Content:     body.Message,
-		Attachments: msgAttachments,
+		ID:            userMsgID,
+		Role:          store.RoleUser,
+		Content:       userContent,
+		RunID:         userMsgID,
+		UserMessageID: userMsgID,
+		Attachments:   msgAttachments,
 	})
 	if err != nil {
 		v1Error(w, http.StatusInternalServerError, err.Error())
@@ -472,18 +633,30 @@ func (s *Server) handleV1Send(w http.ResponseWriter, r *http.Request) {
 	s.events.Publish(project, body.SessionID, stored)
 
 	// Durable outbox record (persist before attempting delivery).
-	payloadBytes, err := json.Marshal(outboxPayloadV1Send{
-		Kind:        outboxPayloadKindV1Send,
-		SessionKey:  body.SessionKey,
-		SessionID:   body.SessionID,
-		Message:     body.Message,
-		Attachments: msgAttachments,
-	})
+	var payloadBytes []byte
+	if isAction {
+		payloadBytes, err = json.Marshal(outboxPayloadV1CardAction{
+			Kind:       outboxPayloadKindV1CardAction,
+			SessionKey: body.SessionKey,
+			SessionID:  body.SessionID,
+			Action:     strings.TrimSpace(body.Action),
+			ReplyCtx:   strings.TrimSpace(body.ReplyCtx),
+		})
+	} else {
+		payloadBytes, err = json.Marshal(outboxPayloadV1Send{
+			Kind:        outboxPayloadKindV1Send,
+			SessionKey:  body.SessionKey,
+			SessionID:   body.SessionID,
+			Message:     body.Message,
+			Attachments: msgAttachments,
+		})
+	}
 	if err != nil {
 		v1Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	ob, err := s.store.CreateOutboxItem(store.CreateOutboxItemInput{
+		ID:          userMsgID,
 		Project:     project,
 		SessionID:   body.SessionID,
 		SessionKey:  body.SessionKey,
@@ -495,13 +668,22 @@ func (s *Server) handleV1Send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.deliverV1SendToUpstreamBridge(r.Context(), project, body, coreImages); err != nil {
+	if s.adapter != nil {
+		s.adapter.SetActiveRun(project, body.SessionKey, body.SessionID, userMsgID, userMsgID)
+	}
+	var deliverErr error
+	if isAction {
+		deliverErr = s.deliverV1CardActionToUpstreamBridge(r.Context(), project, body.SessionKey, body.SessionID, body.Action, body.ReplyCtx)
+	} else {
+		deliverErr = s.deliverV1SendToUpstreamBridge(r.Context(), project, body, ob.ID, coreImages)
+	}
+	if deliverErr != nil {
 		// Mark failed before returning error.
-		if _, markErr := s.store.MarkOutboxFailed(project, ob.ID, err.Error(), time.Now().UTC()); markErr != nil {
+		if _, markErr := s.store.MarkOutboxFailed(project, ob.ID, deliverErr.Error(), time.Now().UTC()); markErr != nil {
 			v1Error(w, http.StatusInternalServerError, markErr.Error())
 			return
 		}
-		v1Error(w, http.StatusServiceUnavailable, err.Error())
+		v1Error(w, http.StatusServiceUnavailable, deliverErr.Error())
 		return
 	}
 	if _, err := s.store.MarkOutboxSent(project, ob.ID); err != nil {
@@ -524,26 +706,55 @@ func (s *Server) deliverOutboxItem(ctx context.Context, item store.OutboxItem) e
 	if len(item.Payload) == 0 {
 		return fmt.Errorf("outbox payload is empty")
 	}
-	var p outboxPayloadV1Send
-	if err := json.Unmarshal(item.Payload, &p); err != nil {
+	var kind struct {
+		Kind string `json:"kind"`
+	}
+	if err := json.Unmarshal(item.Payload, &kind); err != nil {
 		return fmt.Errorf("decode outbox payload: %w", err)
 	}
-	if strings.TrimSpace(p.Kind) != outboxPayloadKindV1Send {
-		return fmt.Errorf("unsupported outbox payload kind %q", p.Kind)
+	switch strings.TrimSpace(kind.Kind) {
+	case outboxPayloadKindV1Send:
+		var p outboxPayloadV1Send
+		if err := json.Unmarshal(item.Payload, &p); err != nil {
+			return fmt.Errorf("decode outbox payload: %w", err)
+		}
+		body := v1SendReq{
+			SessionKey: strings.TrimSpace(p.SessionKey),
+			SessionID:  strings.TrimSpace(p.SessionID),
+			Message:    strings.TrimSpace(p.Message),
+		}
+		if body.SessionKey == "" || body.SessionID == "" {
+			return fmt.Errorf("outbox payload is missing session_key or session_id")
+		}
+		coreImages, err := s.coreImagesFromAttachments(p.Attachments)
+		if err != nil {
+			return err
+		}
+		if s.adapter != nil {
+			s.adapter.SetActiveRun(item.Project, body.SessionKey, body.SessionID, item.ID, item.ID)
+		}
+		return s.deliverV1SendToUpstreamBridge(ctx, item.Project, body, item.ID, coreImages)
+
+	case outboxPayloadKindV1CardAction:
+		var p outboxPayloadV1CardAction
+		if err := json.Unmarshal(item.Payload, &p); err != nil {
+			return fmt.Errorf("decode outbox payload: %w", err)
+		}
+		sessionKey := strings.TrimSpace(p.SessionKey)
+		sessionID := strings.TrimSpace(p.SessionID)
+		action := strings.TrimSpace(p.Action)
+		replyCtx := strings.TrimSpace(p.ReplyCtx)
+		if sessionKey == "" || sessionID == "" || action == "" {
+			return fmt.Errorf("outbox payload is missing session_key/session_id/action")
+		}
+		if s.adapter != nil {
+			s.adapter.SetActiveRun(item.Project, sessionKey, sessionID, item.ID, item.ID)
+		}
+		return s.deliverV1CardActionToUpstreamBridge(ctx, item.Project, sessionKey, sessionID, action, replyCtx)
+
+	default:
+		return fmt.Errorf("unsupported outbox payload kind %q", strings.TrimSpace(kind.Kind))
 	}
-	body := v1SendReq{
-		SessionKey: strings.TrimSpace(p.SessionKey),
-		SessionID:  strings.TrimSpace(p.SessionID),
-		Message:    strings.TrimSpace(p.Message),
-	}
-	if body.SessionKey == "" || body.SessionID == "" {
-		return fmt.Errorf("outbox payload is missing session_key or session_id")
-	}
-	coreImages, err := s.coreImagesFromAttachments(p.Attachments)
-	if err != nil {
-		return err
-	}
-	return s.deliverV1SendToUpstreamBridge(ctx, item.Project, body, coreImages)
 }
 
 func (s *Server) coreImagesFromAttachments(atts []store.Attachment) ([]core.ImageAttachment, error) {
@@ -578,152 +789,58 @@ func (s *Server) coreImagesFromAttachments(atts []store.Attachment) ([]core.Imag
 	return out, nil
 }
 
-func (s *Server) deliverV1SendToUpstreamBridge(ctx context.Context, project string, body v1SendReq, coreImages []core.ImageAttachment) error {
-	// Prefer in-process handler when this webclient server is used as a platform.
-	s.mu.RLock()
-	h := s.projectHandlers[project]
-	p := s.projectPlatforms[project]
-	s.mu.RUnlock()
-	if h != nil {
-		if p == nil {
-			p = newPlatform(s, project)
-		}
-		msg := &core.Message{
-			SessionKey: body.SessionKey,
-			SessionID:  body.SessionID,
-			Platform:   "webclient",
-			UserID:     "web-admin",
-			UserName:   "Web Admin",
-			ChatName:   project,
-			Content:    body.Message,
-			Images:     coreImages,
-			ReplyCtx:   replyContext{Project: project, Session: body.SessionID},
-		}
-		go h(p, msg)
-		return nil
+func (s *Server) deliverV1SendToUpstreamBridge(ctx context.Context, project string, body v1SendReq, msgID string, coreImages []core.ImageAttachment) error {
+	if s.adapter == nil {
+		return fmt.Errorf("upstream bridge adapter is not configured")
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	if err := s.adapter.WaitConnected(waitCtx); err != nil {
+		return fmt.Errorf("upstream bridge adapter not ready: %w", err)
 	}
 
-	// Shell mode: dispatch via upstream bridge WS.
-	bridgePath, bridgeToken, err := s.fetchUpstreamBridgeConfig(ctx)
-	if err != nil {
-		return err
-	}
-	if bridgePath == "" {
-		bridgePath = "/bridge/ws"
-	}
-	if strings.TrimSpace(bridgeToken) == "" {
-		return fmt.Errorf("upstream bridge token is missing")
-	}
-
-	base := strings.TrimSpace(s.opts.ManagementBaseURL)
-	if base == "" {
-		return fmt.Errorf("management proxy is not configured")
-	}
-	baseURL, err := url.Parse(base)
-	if err != nil || baseURL.Scheme == "" || baseURL.Host == "" {
-		return fmt.Errorf("invalid management_base_url")
-	}
-	wsScheme := "ws"
-	if strings.EqualFold(baseURL.Scheme, "https") {
-		wsScheme = "wss"
-	}
-	u := &url.URL{
-		Scheme: wsScheme,
-		Host:   baseURL.Host,
-		Path:   bridgePath,
-	}
-	q := u.Query()
-	q.Set("token", bridgeToken)
-	u.RawQuery = q.Encode()
-
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, u.String(), nil)
-	if err != nil {
-		return fmt.Errorf("dial upstream bridge: %w", err)
-	}
-	defer conn.Close()
-
-	route := "stable"
-
-	fc := map[string]any{
-		"type":                  "frontend_connect",
-		"platform":              "stable",
-		"slot":                  "stable",
-		"app":                   "cc-connect-webclient",
-		"session_key":           body.SessionKey,
-		"transport_session_key": body.SessionKey,
-		"route":                 route,
-		"project":               project,
-		"capabilities":          []string{"text", "image", "card", "buttons", "typing", "update_message", "preview", "reconstruct_reply"},
-		"metadata": map[string]any{
-			"client_kind": "webclient_backend",
-			"project":     project,
-			"route":       route,
-		},
-	}
-	if err := conn.WriteJSON(fc); err != nil {
-		return fmt.Errorf("upstream bridge: send frontend_connect: %w", err)
-	}
-
-	// Read register_ack (best-effort; tolerate if upstream doesn't respond).
-	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	var ack map[string]any
-	_, raw, _ := conn.ReadMessage()
-	_ = json.Unmarshal(raw, &ack)
-	_ = conn.SetReadDeadline(time.Time{})
-
-	msgID := fmt.Sprintf("webclient-%d", time.Now().UnixMilli())
-	wireImages := make([]map[string]any, 0, len(coreImages))
+	wire := make([]bridgeImageData, 0, len(coreImages))
 	for _, img := range coreImages {
 		if len(img.Data) == 0 {
 			continue
 		}
-		wireImages = append(wireImages, map[string]any{
-			"mime_type": strings.TrimSpace(img.MimeType),
-			"data":      base64.StdEncoding.EncodeToString(img.Data),
-			"file_name": strings.TrimSpace(img.FileName),
-		})
+		wire = append(wire, base64EncodeImage(img.MimeType, img.Data, img.FileName))
 	}
-
-	payload := map[string]any{
-		"type":        "message",
-		"msg_id":      msgID,
-		"session_key": body.SessionKey,
-		"session_id":  body.SessionID,
-		"user_id":     "web-admin",
-		"user_name":   "Web Admin",
-		"content":     body.Message,
-		"reply_ctx":   body.SessionKey,
-		"project":     project,
-		"route":       route,
-	}
-	if len(wireImages) > 0 {
-		payload["images"] = wireImages
-	}
-	if err := conn.WriteJSON(payload); err != nil {
-		return fmt.Errorf("upstream bridge: send message: %w", err)
-	}
-	return nil
+	return s.adapter.SendBridgeMessage(ctx, project, body, msgID, nil, wire)
 }
 
-func (s *Server) fetchUpstreamBridgeConfig(ctx context.Context) (path string, token string, err error) {
+func (s *Server) deliverV1CardActionToUpstreamBridge(ctx context.Context, project, sessionKey, sessionID, action, replyCtx string) error {
+	if s.adapter == nil {
+		return fmt.Errorf("upstream bridge adapter is not configured")
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	if err := s.adapter.WaitConnected(waitCtx); err != nil {
+		return fmt.Errorf("upstream bridge adapter not ready: %w", err)
+	}
+	return s.adapter.SendCardAction(ctx, project, sessionKey, sessionID, action, replyCtx)
+}
+
+func (s *Server) fetchUpstreamBridgeConfig(ctx context.Context) (path string, token string, port int, err error) {
 	env, status, err := s.mgmtDo(ctx, http.MethodGet, "/api/v1/status", nil)
 	if err != nil || status < 200 || status >= 300 || !env.OK {
-		return "", "", fmt.Errorf("fetch upstream status failed")
+		return "", "", 0, fmt.Errorf("fetch upstream status failed")
 	}
 	var data struct {
 		Bridge struct {
 			Enabled bool   `json:"enabled"`
+			Port    int    `json:"port"`
 			Path    string `json:"path"`
 			Token   string `json:"token"`
 		} `json:"bridge"`
 	}
 	if err := json.Unmarshal(env.Data, &data); err != nil {
-		return "", "", fmt.Errorf("decode upstream status: %w", err)
+		return "", "", 0, fmt.Errorf("decode upstream status: %w", err)
 	}
 	if !data.Bridge.Enabled {
-		return "", "", fmt.Errorf("upstream bridge is disabled")
+		return "", "", 0, fmt.Errorf("upstream bridge is disabled")
 	}
-	return strings.TrimSpace(data.Bridge.Path), strings.TrimSpace(data.Bridge.Token), nil
+	return strings.TrimSpace(data.Bridge.Path), strings.TrimSpace(data.Bridge.Token), data.Bridge.Port, nil
 }
 
 func (s *Server) persistIncomingImage(img v1BridgeImage) (store.Attachment, core.ImageAttachment, error) {
@@ -838,6 +955,13 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return strings.TrimSpace(b)
+}
+
+func firstNonEmptyTime(a, b time.Time) time.Time {
+	if !a.IsZero() {
+		return a
+	}
+	return b
 }
 
 // --- Upstream helpers ------------------------------------------------------

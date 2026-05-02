@@ -2,6 +2,7 @@ package webclient
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -25,6 +26,9 @@ func TestV1SessionsAndSend_PersistAndDispatch(t *testing.T) {
 		sessionName = "work"
 		upstreamID  = "sess_up_1"
 	)
+
+	bridge := startFakeBridge(t, "bridge-secret")
+	t.Cleanup(bridge.Server.Close)
 
 	var gotAuth []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -61,10 +65,18 @@ func TestV1SessionsAndSend_PersistAndDispatch(t *testing.T) {
 			return
 
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/status":
-			// Proxy passthrough sanity check.
+			// Used by adapter bootstrap (bridge config) and proxy passthrough sanity check.
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"ok":   true,
-				"data": map[string]any{"name": "management"},
+				"ok": true,
+				"data": map[string]any{
+					"name": "management",
+					"bridge": map[string]any{
+						"enabled": true,
+						"port":    bridge.Port,
+						"path":    "/bridge/ws",
+						"token":   bridge.Token,
+					},
+				},
 			})
 			return
 
@@ -87,14 +99,17 @@ func TestV1SessionsAndSend_PersistAndDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-
-	// Register project handler so /send dispatches to engine handler.
-	gotMsg := make(chan *core.Message, 1)
-	p := s.Platform(projectName)
-	if err := p.Start(func(_ core.Platform, msg *core.Message) {
-		gotMsg <- msg
-	}); err != nil {
-		t.Fatalf("platform.Start: %v", err)
+	if s.adapter == nil {
+		t.Fatalf("expected adapter to be configured")
+	}
+	s.adapter.Start()
+	t.Cleanup(s.adapter.Stop)
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := s.adapter.WaitConnected(ctx); err != nil {
+			t.Fatalf("adapter not connected: %v", err)
+		}
 	}
 
 	ts := httptest.NewServer(s.handler)
@@ -187,20 +202,22 @@ func TestV1SessionsAndSend_PersistAndDispatch(t *testing.T) {
 		b, _ := io.ReadAll(res3.Body)
 		t.Fatalf("send status=%d body=%s", res3.StatusCode, string(b))
 	}
-
 	select {
-	case msg := <-gotMsg:
-		if msg.SessionKey != sessionKey {
-			t.Fatalf("msg.SessionKey=%q", msg.SessionKey)
+	case m := <-bridge.Got:
+		if m["type"] != "message" {
+			t.Fatalf("bridge msg type=%v", m["type"])
 		}
-		if msg.SessionID != upstreamID {
-			t.Fatalf("msg.SessionID=%q", msg.SessionID)
+		if m["session_key"] != sessionKey {
+			t.Fatalf("bridge session_key=%v", m["session_key"])
 		}
-		if msg.Content != "hello" {
-			t.Fatalf("msg.Content=%q", msg.Content)
+		if m["session_id"] != upstreamID {
+			t.Fatalf("bridge session_id=%v", m["session_id"])
+		}
+		if m["content"] != "hello" {
+			t.Fatalf("bridge content=%v", m["content"])
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatalf("timeout waiting for handler dispatch")
+		t.Fatalf("timeout waiting for bridge dispatch")
 	}
 
 	// 4) Session detail should include persisted history.
@@ -346,17 +363,53 @@ func TestV1ListSessions_ReturnsActiveKeys(t *testing.T) {
 func TestV1SendWithImages_PersistsAttachments(t *testing.T) {
 	t.Parallel()
 
+	bridge := startFakeBridge(t, "bridge-secret")
+	t.Cleanup(bridge.Server.Close)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok": true,
+				"data": map[string]any{
+					"bridge": map[string]any{
+						"enabled": true,
+						"port":    bridge.Port,
+						"path":    "/bridge/ws",
+						"token":   bridge.Token,
+					},
+				},
+			})
+			return
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"ok":false,"error":"not found"}`))
+			return
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
 	s, err := NewServer(Options{
 		DataDir: t.TempDir(),
+		// enable external adapter path
+		ManagementBaseURL: upstream.URL,
+		ManagementToken:   "mgmt-secret",
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-
-	// Register in-process handler so /send does not require upstream bridge.
-	p := s.Platform("proj")
-	if err := p.Start(func(_ core.Platform, _ *core.Message) {}); err != nil {
-		t.Fatalf("platform.Start: %v", err)
+	if s.adapter == nil {
+		t.Fatalf("expected adapter to be configured")
+	}
+	s.adapter.Start()
+	t.Cleanup(s.adapter.Stop)
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := s.adapter.WaitConnected(ctx); err != nil {
+			t.Fatalf("adapter not connected: %v", err)
+		}
 	}
 
 	ts := httptest.NewServer(s.handler)

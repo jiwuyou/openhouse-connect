@@ -1,5 +1,7 @@
 import api from './client';
 
+export type RunTraceMode = 'auto' | 'expanded' | 'collapsed' | 'hidden';
+
 export interface GlobalSettings {
   language: string;
   attachment_send: string;
@@ -13,6 +15,13 @@ export interface GlobalSettings {
   stream_preview_interval_ms: number;
   rate_limit_max_messages: number;
   rate_limit_window_secs: number;
+
+  // Webclient-only display preferences. Backend may expose either
+  // `run_trace_mode` (flat) or `webclient_display.run_trace_mode` (nested).
+  run_trace_mode?: RunTraceMode;
+  webclient_display?: {
+    run_trace_mode?: RunTraceMode;
+  };
 }
 
 export const getGlobalSettings = () => api.get<GlobalSettings>('/settings');

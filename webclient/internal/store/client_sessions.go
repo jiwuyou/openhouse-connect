@@ -238,6 +238,43 @@ func (s *Store) GetClientSession(project, id string, historyLimit int) (ClientSe
 	return ClientSessionDetail{ClientSession: meta, History: msgs}, nil
 }
 
+// FindProjectForClientSession attempts to locate which project a given
+// (session_key, session_id) belongs to by scanning persisted session metas.
+//
+// This is a best-effort fallback used by the external bridge adapter when an
+// inbound bridge event arrives without an explicit project tag.
+func (s *Store) FindProjectForClientSession(sessionKey, sessionID string) (project string, ok bool, err error) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionKey == "" || sessionID == "" {
+		return "", false, nil
+	}
+	if err := ValidateSegment("session", sessionID); err != nil {
+		return "", false, err
+	}
+	ents, err := os.ReadDir(s.sessionsDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		p := e.Name()
+		meta, err := s.readSessionMeta(p, sessionID)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(meta.SessionKey) == sessionKey {
+			return p, true, nil
+		}
+	}
+	return "", false, nil
+}
+
 func (s *Store) RenameClientSession(project, id, name string) (ClientSession, error) {
 	if err := ValidateSegment("project", project); err != nil {
 		return ClientSession{}, err

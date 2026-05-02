@@ -328,7 +328,16 @@
     "default": "デフォルト",
     "idleTimeout": "アイドルタイムアウト（分）",
     "idleTimeoutHint": "N分間アイドル後にエージェントを自動停止；0 = 無効",
+    "webclientDisplay": "Web クライアント表示",
+    "runTraceMode": "実行トレース表示モード",
+    "runTraceModeHint": "Web チャットで実行過程をどう表示するか",
+    "runTraceModeAuto": "自動（返信後に非表示）",
+    "runTraceModeExpanded": "すべて展開",
+    "runTraceModeCollapsed": "折りたたみ",
+    "runTraceModeHidden": "非表示",
     "display": "表示",
+    "deprecated": "廃止予定",
+    "displayDeprecatedHint": "これらは管理バックエンド（config.toml [display]）のプラットフォーム側表示設定です。Web チャットは「Web クライアント表示」を使ってください。",
     "thinkingMaxLen": "思考の最大文字数",
     "thinkingMaxLenHint": "思考メッセージの最大文字数；0 = 制限なし",
     "toolMaxLen": "ツールの最大文字数",
@@ -345,6 +354,12 @@
     "rlWindowSecsHint": "タイムウィンドウの秒数",
     "log": "ログ",
     "logLevel": "ログレベル"
+  },
+  "runTrace": {
+    "title": "実行トレース",
+    "active": "実行中",
+    "done": "完了",
+    "error": "エラー"
   },
   "globalProviders": {
     "title": "プロバイダー管理",

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import api from '@/api/client';
-import { DEFAULT_WEB_BRIDGE_PLATFORM, WEB_BRIDGE_USER_ID, WEB_BRIDGE_USER_NAME, normalizeWebBridgePlatform } from '@/lib/webPlatform';
+import { sendMessage as sendV1Message } from '@/api/sessions';
 import type { BridgeImagePayload } from '@/lib/attachments';
 
 type BridgeScoped = { session_key: string; session_id?: string };
@@ -45,146 +45,109 @@ export interface UseBridgeSocketOptions {
   onMessage: (msg: BridgeIncoming) => void;
 }
 
-export function useBridgeSocket({ bridgeCfg, platformName = DEFAULT_WEB_BRIDGE_PLATFORM, routeName, sessionKey, sessionId, routeKey, projectName, onMessage }: UseBridgeSocketOptions) {
-  const wsRef = useRef<WebSocket | null>(null);
+// Compatibility hook: historically this connected a browser tab to /bridge/ws via
+// frontend_connect. For the 9840 webclient, the primary path is now the local
+// backend API + SSE stream. We keep the interface so existing pages (e.g.
+// SessionChat) don't need invasive edits.
+export function useBridgeSocket({ bridgeCfg: _bridgeCfg, sessionKey, sessionId, projectName, onMessage }: UseBridgeSocketOptions) {
   const onMessageRef = useRef(onMessage);
   onMessageRef.current = onMessage;
-  const pingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [status, setStatus] = useState<BridgeStatus>('disconnected');
-  const visibleRoute = normalizeWebBridgePlatform(routeName || platformName || DEFAULT_WEB_BRIDGE_PLATFORM);
-  const servicePlatform = normalizeWebBridgePlatform(platformName || visibleRoute);
-  const transportSessionKey = routeKey || sessionKey;
+  const esRef = useRef<EventSource | null>(null);
 
   const send = useCallback((data: Record<string, any>) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(data));
-    }
+    void data;
   }, []);
 
-  const sendMessage = useCallback((content: string, overrideSessionId?: string, images?: BridgeImagePayload[]) => {
+  const sendMessage = useCallback((content: string, overrideSessionId?: string, images?: BridgeImagePayload[], msgId?: string) => {
+    void msgId; // backend generates durable IDs
+    if (!projectName) return;
     const targetSessionId = overrideSessionId || sessionId;
-    send({
-      type: 'message',
-      msg_id: `web-${Date.now()}`,
+    sendV1Message(projectName, {
       session_key: sessionKey,
       session_id: targetSessionId || undefined,
-      transport_session_key: transportSessionKey,
-      route: visibleRoute,
-      user_id: WEB_BRIDGE_USER_ID,
-      user_name: WEB_BRIDGE_USER_NAME,
-      content,
-      reply_ctx: sessionKey,
-      project: projectName || '',
+      message: content,
       images: images && images.length > 0 ? images : undefined,
-    });
-  }, [send, sessionKey, sessionId, transportSessionKey, visibleRoute, projectName]);
+    }).catch(() => {});
+  }, [projectName, sessionKey, sessionId]);
 
   const sendCardAction = useCallback((action: string, overrideSessionId?: string) => {
+    if (!projectName) return;
     const targetSessionId = overrideSessionId || sessionId;
-    send({
-      type: 'card_action',
+    sendV1Message(projectName, {
       session_key: sessionKey,
       session_id: targetSessionId || undefined,
-      transport_session_key: transportSessionKey,
-      route: visibleRoute,
       action,
       reply_ctx: sessionKey,
-      project: projectName || '',
-    });
-  }, [send, sessionKey, sessionId, transportSessionKey, visibleRoute, projectName]);
+    }).catch(() => {});
+  }, [projectName, sessionKey, sessionId]);
 
   const sendPreviewAck = useCallback((refId: string, handle: string) => {
-    send({ type: 'preview_ack', ref_id: refId, preview_handle: handle });
+    // preview is acked by the 9840 backend; keep method for legacy callers
+    void refId;
+    void handle;
   }, [send]);
 
   useEffect(() => {
-    if (!bridgeCfg) return;
-
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // Use current page host:port so the request goes through the Vite/nginx proxy
-    // instead of directly hitting the bridge port (which may not be reachable).
-    const wsPath = bridgeCfg.frontend_path || bridgeCfg.client_path || bridgeCfg.path;
-    const wsToken = bridgeCfg.frontend_token || bridgeCfg.token;
-    const wsUrl = `${proto}//${window.location.host}${wsPath}?token=${encodeURIComponent(wsToken)}`;
-
-    let ws: WebSocket;
-    let reconnectTimer: ReturnType<typeof setTimeout>;
     let alive = true;
+    if (!projectName || !sessionId) {
+      setStatus('disconnected');
+      return;
+    }
 
-    const connect = () => {
-      if (!alive) return;
-      setStatus('connecting');
-      ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
+    const token = api.getToken();
+    const base = `/api/projects/${encodeURIComponent(projectName)}/sessions/${encodeURIComponent(sessionId)}/events`;
+    const url = token ? `${base}?token=${encodeURIComponent(token)}` : base;
 
-      ws.onopen = () => {
-        setStatus('registering');
-        ws.send(JSON.stringify({
-          type: 'frontend_connect',
-          platform: servicePlatform,
-          slot: visibleRoute,
-          app: 'cc-connect-web',
-          session_key: sessionKey,
-          transport_session_key: transportSessionKey,
-          route: visibleRoute,
-          project: projectName || undefined,
-          capabilities: ['text', 'image', 'card', 'buttons', 'typing', 'update_message', 'preview', 'reconstruct_reply'],
-          metadata: {
-            version: '1.0.0',
-            description: 'Web Admin Dashboard',
-            client_kind: 'frontend_browser',
-            frontend_slot: visibleRoute,
-            route: visibleRoute,
-            service_platform: servicePlatform,
-            transport_session_key: transportSessionKey,
-            project: projectName || '',
-          },
-        }));
-      };
+    setStatus('connecting');
+    const es = new EventSource(url);
+    esRef.current = es;
 
-      ws.onmessage = (evt) => {
-        try {
-          const msg = JSON.parse(evt.data) as BridgeIncoming;
-          if (msg.type === 'register_ack') {
-            if (msg.ok) {
-              setStatus('connected');
-              pingRef.current = setInterval(() => {
-                send({ type: 'ping', ts: Date.now() });
-              }, 25000);
-            } else {
-              setStatus('error');
-            }
-          }
-          onMessageRef.current(msg);
-        } catch { /* ignore parse errors */ }
-      };
-
-      ws.onclose = () => {
-        setStatus('disconnected');
-        wsRef.current = null;
-        if (pingRef.current) clearInterval(pingRef.current);
-        if (alive) reconnectTimer = setTimeout(connect, 3000);
-      };
-
-      ws.onerror = () => {
-        setStatus('error');
-      };
+    es.onopen = () => {
+      if (alive) setStatus('connected');
     };
+    es.onerror = () => {
+      if (alive) setStatus('error');
+    };
+    es.addEventListener('message', (evt: MessageEvent) => {
+      try {
+        const m = JSON.parse(String((evt as any).data || '{}')) as any;
+        if (String(m.role || '') !== 'assistant') return;
 
-    connect();
+        const attachments = Array.isArray(m.attachments) ? m.attachments : [];
+        const images = attachments
+          .filter((a: any) => String(a.kind || '').toLowerCase() === 'image')
+          .map((a: any) => ({
+            id: a.id,
+            mime_type: a.mime_type || a.mimeType,
+            url: a.url,
+            file_name: a.file_name || a.fileName,
+            size: a.size,
+          }));
+
+        onMessageRef.current({
+          type: 'reply',
+          session_key: sessionKey,
+          session_id: sessionId,
+          reply_ctx: sessionKey,
+          content: String(m.content || ''),
+          format: 'markdown',
+          images: images.length ? images : undefined,
+        } as any);
+      } catch {
+        // ignore parse errors
+      }
+    });
 
     return () => {
       alive = false;
-      clearTimeout(reconnectTimer);
-      if (pingRef.current) clearInterval(pingRef.current);
-      if (wsRef.current) {
-        wsRef.current.onclose = null;
-        wsRef.current.close();
-        wsRef.current = null;
+      if (esRef.current) {
+        esRef.current.close();
+        esRef.current = null;
       }
       setStatus('disconnected');
     };
-  }, [bridgeCfg, servicePlatform, visibleRoute, sessionKey, transportSessionKey, projectName, send]);
+  }, [projectName, sessionId, sessionKey]);
 
   return { status, send, sendMessage, sendCardAction, sendPreviewAck };
 }
@@ -193,17 +156,18 @@ export function useBridgeSocket({ bridgeCfg, platformName = DEFAULT_WEB_BRIDGE_P
 export async function fetchBridgeConfig(): Promise<BridgeConfig | null> {
   try {
     const status = await api.get<any>('/status');
-    if (status.bridge?.enabled) {
-      return {
-        port: status.bridge.port,
-        path: status.bridge.path,
-        token: status.bridge.token,
-        frontend_path: status.bridge.frontend_path,
-        client_path: status.bridge.client_path,
-        frontend_token: status.bridge.frontend_token,
-        service_platform: status.bridge.service_platform,
-      };
-    }
-  } catch { /* bridge not available */ }
-  return null;
+    const token = String(status.bridge?.token || api.getToken() || '');
+    return {
+      port: Number(status.bridge?.port || 0),
+      path: String(status.bridge?.path || '/bridge/ws'),
+      token,
+      frontend_path: status.bridge?.frontend_path,
+      client_path: status.bridge?.client_path,
+      frontend_token: status.bridge?.frontend_token,
+      service_platform: status.bridge?.service_platform,
+    };
+  } catch {
+    // Return a stub so legacy pages don't block chat when bridge is disabled.
+    return { port: 0, path: '/bridge/ws', token: api.getToken() || '' };
+  }
 }

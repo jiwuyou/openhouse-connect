@@ -328,7 +328,16 @@
     "default": "默认",
     "idleTimeout": "空闲超时（分钟）",
     "idleTimeoutHint": "Agent 空闲 N 分钟后自动停止；0 = 不启用",
+    "webclientDisplay": "网页客户端显示",
+    "runTraceMode": "运行轨迹显示模式",
+    "runTraceModeHint": "控制网页对话中运行过程的展示方式",
+    "runTraceModeAuto": "自动（回复后隐藏）",
+    "runTraceModeExpanded": "全部展开",
+    "runTraceModeCollapsed": "收缩条",
+    "runTraceModeHidden": "全部隐藏",
     "display": "显示",
+    "deprecated": "已弃用",
+    "displayDeprecatedHint": "这些选项属于管理后端的平台侧显示配置（config.toml [display]）。网页对话请使用「网页客户端显示」。",
     "thinkingMaxLen": "思考最大长度",
     "thinkingMaxLenHint": "思考消息的最大字符数；0 = 不截断",
     "toolMaxLen": "工具最大长度",
@@ -345,6 +354,12 @@
     "rlWindowSecsHint": "时间窗口的秒数",
     "log": "日志",
     "logLevel": "日志级别"
+  },
+  "runTrace": {
+    "title": "运行轨迹",
+    "active": "运行中",
+    "done": "已完成",
+    "error": "错误"
   },
   "globalProviders": {
     "title": "服务商管理",

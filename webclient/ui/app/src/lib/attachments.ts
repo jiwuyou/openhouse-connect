@@ -249,6 +249,7 @@ function normalizeImageUrl(url?: string): SafeImageUrl | null {
   const raw = (url || '').trim();
   if (!raw) return null;
   if (raw.startsWith('data:')) return parseSafeDataImageUrl(raw);
+  if (raw.startsWith('/attachments/')) return { kind: 'url', url: raw };
 
   try {
     const parsed = new URL(raw);

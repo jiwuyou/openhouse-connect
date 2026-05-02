@@ -32,11 +32,16 @@ type Attachment struct {
 }
 
 type Message struct {
-	ID          string       `json:"id"`
-	Role        string       `json:"role"`
-	Content     string       `json:"content,omitempty"`
-	Timestamp   time.Time    `json:"timestamp"`
-	Attachments []Attachment `json:"attachments,omitempty"`
+	ID        string    `json:"id"`
+	Role      string    `json:"role"`
+	Content   string    `json:"content,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
+	// RunID/UserMessageID are webclient-local correlation fields that allow the
+	// UI to attach transient run_events to the durable message timeline.
+	// They are optional and may be empty for legacy data.
+	RunID         string       `json:"run_id,omitempty"`
+	UserMessageID string       `json:"user_message_id,omitempty"`
+	Attachments   []Attachment `json:"attachments,omitempty"`
 }
 
 type SessionSummary struct {
@@ -54,12 +59,14 @@ type AttachmentMeta struct {
 }
 
 type Store struct {
-	root        string
-	publicURL   string
-	messagesDir string
-	attachDir   string
-	sessionsDir string
-	outboxDir   string
+	root         string
+	publicURL    string
+	messagesDir  string
+	attachDir    string
+	sessionsDir  string
+	outboxDir    string
+	runEventsDir string
+	settingsPath string
 
 	mu        sync.Mutex
 	sessLocks map[string]*sync.Mutex
@@ -71,6 +78,8 @@ type Store struct {
 
 	outboxMu sync.Mutex
 
+	settingsMu sync.Mutex
+
 	liveMu sync.RWMutex
 	live   map[string]bool // key: project+"\n"+sessionID
 }
@@ -79,15 +88,17 @@ func New(root string, publicURL string) (*Store, error) {
 	root = filepath.Clean(root)
 	publicURL = strings.TrimRight(strings.TrimSpace(publicURL), "/")
 	s := &Store{
-		root:        root,
-		publicURL:   publicURL,
-		messagesDir: filepath.Join(root, "messages"),
-		attachDir:   filepath.Join(root, "attachments"),
-		sessionsDir: filepath.Join(root, "sessions"),
-		outboxDir:   filepath.Join(root, "outbox"),
-		sessLocks:   make(map[string]*sync.Mutex),
-		attach:      make(map[string]AttachmentMeta),
-		live:        make(map[string]bool),
+		root:         root,
+		publicURL:    publicURL,
+		messagesDir:  filepath.Join(root, "messages"),
+		attachDir:    filepath.Join(root, "attachments"),
+		sessionsDir:  filepath.Join(root, "sessions"),
+		outboxDir:    filepath.Join(root, "outbox"),
+		runEventsDir: filepath.Join(root, "run_events"),
+		settingsPath: filepath.Join(root, "settings.json"),
+		sessLocks:    make(map[string]*sync.Mutex),
+		attach:       make(map[string]AttachmentMeta),
+		live:         make(map[string]bool),
 	}
 	if err := os.MkdirAll(s.messagesDir, 0o755); err != nil {
 		return nil, fmt.Errorf("webclient store: mkdir messages: %w", err)
@@ -100,6 +111,9 @@ func New(root string, publicURL string) (*Store, error) {
 	}
 	if err := os.MkdirAll(s.outboxDir, 0o755); err != nil {
 		return nil, fmt.Errorf("webclient store: mkdir outbox: %w", err)
+	}
+	if err := os.MkdirAll(s.runEventsDir, 0o755); err != nil {
+		return nil, fmt.Errorf("webclient store: mkdir run_events: %w", err)
 	}
 	if err := s.loadAttachmentIndex(); err != nil {
 		return nil, err

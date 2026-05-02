@@ -31,6 +31,14 @@ import {
   type WebImageAttachment,
 } from '@/lib/attachments';
 
+interface WebFileAttachment {
+  id: string;
+  url?: string;
+  fileName?: string;
+  size?: number;
+  mimeType?: string;
+}
+
 // ── Markdown renderers ───────────────────────────────────────
 
 function CopyButton({ code }: { code: string }) {
@@ -115,6 +123,7 @@ interface ChatMsg {
   fileName?: string;
   fileSize?: number;
   images?: WebImageAttachment[];
+  files?: WebFileAttachment[];
   streaming?: boolean;
   timestamp?: string;
 }
@@ -215,8 +224,8 @@ function ButtonsBlock({ content, buttons, onAction }: { content: string; buttons
 
 // ── File/Image attachments ───────────────────────────────────
 
-function FileBlock({ name, size }: { name: string; size?: number }) {
-  return (
+function FileBlock({ name, size, url }: { name: string; size?: number; url?: string }) {
+  const inner = (
     <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700">
       <FileText size={16} className="text-gray-400 shrink-0" />
       <div className="min-w-0">
@@ -224,6 +233,12 @@ function FileBlock({ name, size }: { name: string; size?: number }) {
         {size !== undefined && <div className="text-xs text-gray-400">{(size / 1024).toFixed(1)} KB</div>}
       </div>
     </div>
+  );
+  if (!url) return inner;
+  return (
+    <a href={url} target="_blank" rel="noreferrer" className="block hover:opacity-95 transition-opacity">
+      {inner}
+    </a>
   );
 }
 
@@ -277,6 +292,7 @@ const MessageBubble = memo(function MessageBubble({ msg, onAction }: { msg: Chat
   const { t } = useTranslation();
   const isUser = msg.role === 'user';
   const hasImages = Boolean(msg.images?.length);
+  const hasFiles = Boolean(msg.files?.length);
   return (
     <div className={cn('flex gap-2 sm:gap-3 min-w-0', isUser ? 'justify-end' : 'justify-start')}>
       {!isUser && (
@@ -311,6 +327,21 @@ const MessageBubble = memo(function MessageBubble({ msg, onAction }: { msg: Chat
             className={msg.content || msg.format === 'image' || msg.format === 'file' ? 'mt-3' : ''}
             downloadLabel={t('chat.downloadImage')}
           />
+        )}
+        {hasFiles && (
+          <div className={cn(
+            'space-y-2',
+            msg.content || msg.format === 'image' || msg.format === 'file' || hasImages ? 'mt-3' : '',
+          )}>
+            {(msg.files || []).map((f) => (
+              <FileBlock
+                key={f.id}
+                name={f.fileName || t('chat.attachmentFile', 'Attachment')}
+                size={f.size}
+                url={f.url}
+              />
+            ))}
+          </div>
         )}
         {msg.streaming && (
           <span className="inline-block w-1.5 h-4 bg-accent/60 rounded-sm ml-0.5 animate-pulse" />
@@ -454,6 +485,21 @@ export default function SessionChat() {
   const webTransportPlatform = useMemo(() => getWebBridgeTransportPlatform(webRoute), [webRoute]);
   const routeSessionKey = project ? webRouteSessionKey(project, webRoute) : sessionKey;
 
+  const normalizeFileAttachments = useCallback((raw: unknown): WebFileAttachment[] => {
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map((item: any, idx: number): WebFileAttachment | null => {
+        if (!item || typeof item !== 'object') return null;
+        const id = String(item.id || `file-${idx}`);
+        const url = typeof item.url === 'string' ? item.url : undefined;
+        const fileName = (item.file_name || item.fileName || item.name || item.file || '').toString() || undefined;
+        const size = typeof item.size === 'number' ? item.size : undefined;
+        const mimeType = (item.mime_type || item.mimeType || item.type || '').toString() || undefined;
+        return { id, url, fileName, size, mimeType };
+      })
+      .filter((v): v is WebFileAttachment => Boolean(v));
+  }, []);
+
   // Load session data + bridge config
   const fetchSession = useCallback(async () => {
     if (!project || !id) return;
@@ -467,18 +513,25 @@ export default function SessionChat() {
       setBridgeCfg(cfg);
       if (data.history) {
         setMessages(data.history.map((h, i) => ({
-          id: `hist-${i}`,
+          id: (h as any).id || (typeof (h as any).seq === 'number' ? `seq-${(h as any).seq}` : `hist-${i}`),
           role: h.role as 'user' | 'assistant',
           content: h.content,
           format: 'markdown',
           images: normalizeImageAttachments((h as any).images, 'history'),
+          files: normalizeFileAttachments(
+            Array.isArray((h as any).files)
+              ? (h as any).files
+              : Array.isArray((h as any).attachments)
+                ? ((h as any).attachments as any[]).filter((a) => String(a?.kind || '').toLowerCase() === 'file')
+                : undefined,
+          ),
           timestamp: h.timestamp,
         })));
       }
     } finally {
       setLoading(false);
     }
-  }, [project, id]);
+  }, [project, id, normalizeFileAttachments]);
 
   useEffect(() => { fetchSession(); }, [fetchSession]);
 

@@ -1041,7 +1041,7 @@ func buildProjectRuntime(cfg *config.Config, proj config.ProjectConfig, configPa
 		platforms = append(platforms, p)
 	}
 
-	if webclientSrv != nil {
+	if webclientSrv != nil && !webclientSrv.UsesExternalAdapter() {
 		platforms = append(platforms, webclientSrv.Platform(proj.Name))
 	}
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -230,15 +231,18 @@ func (sess *bridgeUpstreamSession) close() error {
 func (sess *bridgeUpstreamSession) broadcast(mt int, raw []byte) {
 	f := bridgeFrame{mt: mt, raw: append([]byte(nil), raw...)}
 
-	// Store into replay buffer.
-	sess.bufMu.Lock()
-	sess.buf = append(sess.buf, f)
-	if len(sess.buf) > bridgeReplayBufferMax {
-		sess.buf = sess.buf[len(sess.buf)-bridgeReplayBufferMax:]
-	}
-	sess.bufMu.Unlock()
-
 	sess.mu.Lock()
+	// Store into replay buffer only when no browsers are attached. This prevents
+	// refresh/reconnect from re-appending already-seen durable messages (e.g.
+	// images) to the bottom of the chat timeline.
+	if sess.subs == nil || len(sess.subs) == 0 {
+		sess.bufMu.Lock()
+		sess.buf = append(sess.buf, f)
+		if len(sess.buf) > bridgeReplayBufferMax {
+			sess.buf = sess.buf[len(sess.buf)-bridgeReplayBufferMax:]
+		}
+		sess.bufMu.Unlock()
+	}
 	for d := range sess.subs {
 		select {
 		case d.send <- f:
@@ -462,10 +466,24 @@ func (s *Server) upstreamBridgeWSURL(r *http.Request) (string, error) {
 		return "", fmt.Errorf("unsupported upstream scheme %q", baseURL.Scheme)
 	}
 
+	hostPort := baseURL.Host
+	hostname := hostPort
+	if h, _, err := net.SplitHostPort(hostPort); err == nil && strings.TrimSpace(h) != "" {
+		hostname = h
+	}
+	path := r.URL.Path
+	if upPath, _, upPort, err := s.fetchUpstreamBridgeConfig(r.Context()); err == nil {
+		if strings.TrimSpace(upPath) != "" {
+			path = strings.TrimSpace(upPath)
+		}
+		if upPort > 0 {
+			hostPort = net.JoinHostPort(hostname, fmt.Sprintf("%d", upPort))
+		}
+	}
 	u := &url.URL{
 		Scheme:   wsScheme,
-		Host:     baseURL.Host,
-		Path:     r.URL.Path,
+		Host:     hostPort,
+		Path:     path,
 		RawQuery: r.URL.RawQuery, // must preserve ?token=... exactly
 	}
 	return u.String(), nil
@@ -644,6 +662,53 @@ func (s *Server) bridgePersistInbound(state *bridgeProxyState, raw []byte) error
 			return nil
 		}
 		return s.persistBridgeAssistantEvent(project, base.Type, r, raw)
+	case "error":
+		var ev struct {
+			SessionKey string `json:"session_key"`
+			SessionID  string `json:"session_id,omitempty"`
+			Code       string `json:"code,omitempty"`
+			Message    string `json:"message,omitempty"`
+		}
+		if err := json.Unmarshal(raw, &ev); err != nil {
+			return nil
+		}
+		project, _, _, _ := state.snapshot()
+		if project == "" {
+			return nil
+		}
+		sessionKey := strings.TrimSpace(ev.SessionKey)
+		if sessionKey == "" {
+			return nil
+		}
+		sessionID, err := s.ensureClientSessionForBridge(project, sessionKey, strings.TrimSpace(ev.SessionID))
+		if err != nil {
+			return err
+		}
+		msg := strings.TrimSpace(ev.Message)
+		code := strings.TrimSpace(ev.Code)
+		if code != "" && msg != "" {
+			msg = "[error] " + code + ": " + msg
+		} else if msg != "" {
+			msg = "[error] " + msg
+		} else if code != "" {
+			msg = "[error] " + code
+		} else {
+			msg = "[error]"
+		}
+		run, ok := s.bestEffortLastUserRun(project, sessionID)
+		runID := strings.TrimSpace(run.RunID)
+		userMsgID := strings.TrimSpace(run.UserMessageID)
+		if !ok {
+			runID = ""
+			userMsgID = ""
+		}
+		_, err = s.store.AppendMessage(project, sessionID, store.Message{
+			Role:          store.RoleAssistant,
+			Content:       msg,
+			RunID:         runID,
+			UserMessageID: userMsgID,
+		})
+		return err
 	}
 	return nil
 }
@@ -771,23 +836,73 @@ func (s *Server) persistBridgeAssistantEvent(project, typ string, r bridgeReply,
 	}
 
 	content := strings.TrimSpace(r.Content)
+	// Transient progress events must not be persisted as durable assistant
+	// messages. Persist them into run_events so the UI can optionally render them
+	// as "run trace" tied to a user message.
+	switch typ {
+	case "reply_stream", "preview_start", "update_message", "delete_message":
+		run, ok := s.bestEffortLastUserRun(project, sessionID)
+		runID := strings.TrimSpace(run.RunID)
+		userMsgID := strings.TrimSpace(run.UserMessageID)
+		metadata := map[string]any{}
+		status := "active"
+		switch typ {
+		case "reply_stream":
+			// Store only terminal stream snapshots to keep run_events compact.
+			if !r.Done {
+				return nil
+			}
+			status = "completed"
+			metadata["done"] = r.Done
+			if strings.TrimSpace(r.Delta) != "" {
+				metadata["delta"] = r.Delta
+			}
+			if strings.TrimSpace(r.FullText) != "" {
+				metadata["full_text"] = r.FullText
+				content = strings.TrimSpace(r.FullText)
+			} else if content == "" {
+				content = "[reply_stream] " + stableJSON(raw)
+			}
+			if strings.TrimSpace(r.PreviewHandle) != "" {
+				metadata["preview_handle"] = strings.TrimSpace(r.PreviewHandle)
+			}
+		case "preview_start":
+			if content == "" {
+				content = strings.TrimSpace(r.Content)
+			}
+			if strings.TrimSpace(r.RefID) != "" {
+				metadata["ref_id"] = strings.TrimSpace(r.RefID)
+			}
+			if strings.TrimSpace(r.ReplyCtx) != "" {
+				metadata["reply_ctx"] = strings.TrimSpace(r.ReplyCtx)
+			}
+		case "update_message", "delete_message":
+			if strings.TrimSpace(r.PreviewHandle) != "" {
+				metadata["preview_handle"] = strings.TrimSpace(r.PreviewHandle)
+			}
+		}
+		if !ok {
+			runID = ""
+			userMsgID = ""
+		}
+		storedEv, err := s.store.AppendRunEvent(project, sessionID, store.RunEvent{
+			RunID:         runID,
+			UserMessageID: userMsgID,
+			SessionID:     sessionID,
+			Type:          typ,
+			Content:       content,
+			Status:        status,
+			CreatedAt:     time.Now().UTC(),
+			Timestamp:     time.Now().UTC(),
+			Metadata:      metadata,
+		})
+		if err == nil {
+			s.runEvts.Publish(project, sessionID, storedEv)
+		}
+		return err
+	}
 	switch typ {
 	case "card", "buttons":
-		if content == "" {
-			content = "[" + typ + "] " + stableJSON(raw)
-		}
-	case "reply_stream":
-		// Persist only the final assembled text to avoid spamming history with
-		// deltas.
-		if !r.Done {
-			return nil
-		}
-		if strings.TrimSpace(r.FullText) != "" {
-			content = strings.TrimSpace(r.FullText)
-		} else if content == "" {
-			content = "[reply_stream] " + stableJSON(raw)
-		}
-	case "preview_start", "update_message", "delete_message":
 		if content == "" {
 			content = "[" + typ + "] " + stableJSON(raw)
 		}

@@ -188,4 +188,3 @@ var _ core.Platform = (*platform)(nil)
 var _ core.ImageSender = (*platform)(nil)
 var _ core.FileSender = (*platform)(nil)
 var _ core.ReplyContextReconstructor = (*platform)(nil)
-

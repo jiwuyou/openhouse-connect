@@ -46,6 +46,7 @@ type Server struct {
 
 	store   *store.Store
 	events  *broker.Hub
+	runEvts *broker.RunHub
 	handler http.Handler
 	root    string
 
@@ -60,6 +61,11 @@ type Server struct {
 	static http.Handler
 
 	managementProxy *httputil.ReverseProxy
+
+	adapter *adapterClient
+
+	// Prevent concurrent outbox recovery loops from double-delivering due items.
+	outboxRecoverMu sync.Mutex
 }
 
 func NewServer(opts Options) (*Server, error) {
@@ -86,6 +92,7 @@ func NewServer(opts Options) (*Server, error) {
 		opts:            opts,
 		store:           st,
 		events:          broker.NewHub(),
+		runEvts:         broker.NewRunHub(),
 		root:            root,
 		projectHandlers: make(map[string]core.MessageHandler),
 	}
@@ -98,11 +105,18 @@ func NewServer(opts Options) (*Server, error) {
 		}
 	}
 	s.handler = s.newMux()
+	if opts.ManagementBaseURL != "" {
+		s.adapter = newAdapterClient(s)
+	}
 	return s, nil
 }
 
 func (s *Server) Platform(project string) core.Platform {
 	return newPlatform(s, project)
+}
+
+func (s *Server) UsesExternalAdapter() bool {
+	return s != nil && s.adapter != nil
 }
 
 func (s *Server) Start() error {
@@ -137,15 +151,21 @@ func (s *Server) Start() error {
 		slog.Error("webclient: http server exited unexpectedly", "error", err)
 	}()
 
-	// Best-effort recovery: attempt due outbox items once at startup.
-	// This is intentionally minimal (no persistent goroutine); it provides
-	// a real recovery path after restart.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if n, err := s.recoverOutboxOnce(ctx, 50); err != nil {
-		slog.Warn("webclient: outbox recovery failed", "error", err)
-	} else if n > 0 {
-		slog.Info("webclient: outbox recovery attempted", "count", n)
+	if s.adapter != nil {
+		s.adapter.Start()
+		// Best-effort recovery: wait briefly for adapter readiness (bridge/mgmt
+		// start after webclient in the single-binary setup), then attempt due
+		// outbox items once.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			_ = s.adapter.WaitReady(ctx)
+			if n, err := s.recoverOutboxOnce(ctx, 50); err != nil {
+				slog.Warn("webclient: outbox recovery failed", "error", err)
+			} else if n > 0 {
+				slog.Info("webclient: outbox recovery attempted", "count", n)
+			}
+		}()
 	}
 
 	return nil
@@ -154,6 +174,9 @@ func (s *Server) Start() error {
 // recoverOutboxOnce scans due outbox items and attempts delivery.
 // Tests may call this directly; Start also invokes it once.
 func (s *Server) recoverOutboxOnce(ctx context.Context, limit int) (int, error) {
+	s.outboxRecoverMu.Lock()
+	defer s.outboxRecoverMu.Unlock()
+
 	items, err := s.store.ListOutboxDue(time.Now().UTC(), limit)
 	if err != nil {
 		return 0, err
@@ -185,6 +208,10 @@ func (s *Server) Stop(ctx context.Context) error {
 	s.mu.Unlock()
 
 	s.events.Close()
+	s.runEvts.Close()
+	if s.adapter != nil {
+		s.adapter.Stop()
+	}
 	if ln != nil {
 		_ = ln.Close()
 	}
@@ -216,6 +243,8 @@ func (s *Server) newMux() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/projects/{project}/sessions/{id}", s.wrap(s.handleV1DeleteSession))
 	mux.HandleFunc("POST /api/v1/projects/{project}/sessions/switch", s.wrap(s.handleV1SwitchSession))
 	mux.HandleFunc("POST /api/v1/projects/{project}/send", s.wrap(s.handleV1Send))
+	mux.HandleFunc("GET /api/v1/settings", s.wrap(s.handleV1GetSettings))
+	mux.HandleFunc("PATCH /api/v1/settings", s.wrap(s.handleV1PatchSettings))
 
 	// Management facade used by the copied web admin frontend served on 9840.
 	for _, method := range []string{
@@ -228,9 +257,11 @@ func (s *Server) newMux() http.Handler {
 	} {
 		mux.HandleFunc(method+" /api/v1/{path...}", s.wrap(s.handleManagementProxy))
 	}
-	// /bridge/ws is the primary chat path used by the copied admin frontend.
-	// We intercept WebSocket upgrades so 9840 can persist chat history locally.
-	// Non-WebSocket requests (e.g. health checks) still proxy upstream.
+	// Legacy compatibility: older/copied shells used /bridge/ws (frontend_connect)
+	// directly. The intended webclient flow is:
+	// browser -> 9840 /api/v1/... -> 9840 adapter -> upstream bridge.
+	// We keep /bridge/ws to avoid breaking old clients; new clients should not
+	// rely on frontend_connect as the primary path.
 	mux.HandleFunc("GET /bridge/ws", s.handleBridgeWS)
 	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete, http.MethodOptions} {
 		mux.HandleFunc(method+" /bridge/{path...}", s.handleBridgeProxy)
@@ -463,8 +494,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	ch, cancel := s.events.Subscribe(project, session)
-	defer cancel()
+	msgCh, cancelMsg := s.events.Subscribe(project, session)
+	defer cancelMsg()
+	runCh, cancelRun := s.runEvts.Subscribe(project, session)
+	defer cancelRun()
 
 	// Initial ping to establish the stream.
 	_, _ = w.Write([]byte(": ok\n\n"))
@@ -481,13 +514,24 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-ticker.C:
 			_, _ = w.Write([]byte(": ping\n\n"))
 			flusher.Flush()
-		case msg, ok := <-ch:
+		case msg, ok := <-msgCh:
 			if !ok {
 				return
 			}
 			_, _ = w.Write([]byte("event: message\n"))
 			_, _ = w.Write([]byte("data: "))
 			if err := enc.Encode(msg); err != nil {
+				return
+			}
+			_, _ = w.Write([]byte("\n"))
+			flusher.Flush()
+		case ev, ok := <-runCh:
+			if !ok {
+				return
+			}
+			_, _ = w.Write([]byte("event: run_event\n"))
+			_, _ = w.Write([]byte("data: "))
+			if err := enc.Encode(ev); err != nil {
 				return
 			}
 			_, _ = w.Write([]byte("\n"))
@@ -631,4 +675,45 @@ func (s *Server) attachmentURL(id string) string {
 		sep = "&"
 	}
 	return base + sep + "token=" + url.QueryEscape(s.opts.Token)
+}
+
+func (s *Server) bestEffortFindProjectForSession(sessionKey, sessionID string) (string, bool) {
+	if s.store == nil {
+		return "", false
+	}
+	project, ok, err := s.store.FindProjectForClientSession(sessionKey, sessionID)
+	if err != nil || !ok {
+		return "", false
+	}
+	return strings.TrimSpace(project), true
+}
+
+func (s *Server) bestEffortLastUserRun(project, sessionID string) (runRef, bool) {
+	if s.store == nil {
+		return runRef{}, false
+	}
+	msgs, err := s.store.ReadMessages(project, sessionID)
+	if err != nil || len(msgs) == 0 {
+		return runRef{}, false
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := msgs[i]
+		if strings.TrimSpace(m.Role) != store.RoleUser {
+			continue
+		}
+		id := strings.TrimSpace(m.ID)
+		if id == "" {
+			continue
+		}
+		runID := strings.TrimSpace(m.RunID)
+		if runID == "" {
+			runID = id
+		}
+		userID := strings.TrimSpace(m.UserMessageID)
+		if userID == "" {
+			userID = id
+		}
+		return runRef{RunID: runID, UserMessageID: userID, UpdatedAt: m.Timestamp}, true
+	}
+	return runRef{}, false
 }
