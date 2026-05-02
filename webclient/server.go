@@ -101,6 +101,7 @@ type Server struct {
 	defaultApp   *appRuntime
 
 	mu               sync.RWMutex
+	applyMu          sync.Mutex // serializes ApplyApps/Start/Stop to avoid interleaving runtime mutations
 	started          bool
 	httpServer       *http.Server
 	listener         net.Listener
@@ -115,6 +116,15 @@ type Server struct {
 	// adapter is kept for legacy tests and single-app mode; it aliases the
 	// default app runtime adapter when present.
 	adapter *adapterClient
+}
+
+// ApplyAppsResult summarizes changes applied by Server.ApplyApps.
+// It is intended for logging/diagnostics only.
+type ApplyAppsResult struct {
+	Added            []string
+	Removed          []string
+	AdapterRestarted []string // app IDs whose external adapter was restarted due to platform change
+	DefaultAppID     string
 }
 
 func NewServer(opts Options) (*Server, error) {
@@ -154,15 +164,344 @@ func NewServer(opts Options) (*Server, error) {
 	return s, nil
 }
 
+// ApplyApps hot-reloads the multi-app runtime configuration without restarting the HTTP server.
+//
+// Supported updates (multi-app mode only):
+// - add an enabled app
+// - remove/disable an app
+// - switch default app
+// - change an app platform name (restarts that app's external adapter)
+//
+// Not supported (returns error and leaves runtime unchanged):
+// - host/port/data_dir changes
+// - switching between legacy single-app mode (Apps empty) and multi-app mode (Apps non-empty)
+// - changing an existing app's data_namespace
+func (s *Server) ApplyApps(opts Options) (*ApplyAppsResult, error) {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+
+	// Normalize input like NewServer.
+	opts.Host = strings.TrimSpace(opts.Host)
+	opts.DataDir = strings.TrimSpace(opts.DataDir)
+	if opts.Port == 0 {
+		opts.Port = 9840
+	}
+
+	if opts.DataDir == "" {
+		return nil, fmt.Errorf("webclient: DataDir is required")
+	}
+	if opts.Port < 0 {
+		return nil, fmt.Errorf("webclient: invalid port %d", opts.Port)
+	}
+
+	// Snapshot current state under lock (authoritative).
+	s.mu.Lock()
+	curHost := strings.TrimSpace(s.opts.Host)
+	curPort := s.opts.Port
+	if curPort == 0 {
+		curPort = 9840
+	}
+	curDataDir := strings.TrimSpace(s.opts.DataDir)
+	curModeLegacy := len(s.opts.Apps) == 0
+	started := s.started
+	curApps := make(map[string]*appRuntime, len(s.apps))
+	for id, rt := range s.apps {
+		curApps[id] = rt
+	}
+
+	// Reject immutable runtime fields.
+	if opts.Host != curHost {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("webclient: hot update of host is not supported")
+	}
+	if opts.Port != curPort {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("webclient: hot update of port is not supported")
+	}
+	if filepath.Clean(opts.DataDir) != filepath.Clean(curDataDir) {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("webclient: hot update of data_dir is not supported")
+	}
+
+	// Reject mode switches. (We key legacy-vs-multi on the original opts set at construction.)
+	nextModeLegacy := len(opts.Apps) == 0
+	if curModeLegacy != nextModeLegacy {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("webclient: switching between legacy and multi-app modes is not supported")
+	}
+
+	// Legacy mode: no app hot reload semantics (nothing to do).
+	if curModeLegacy {
+		s.mu.Unlock()
+		return &ApplyAppsResult{DefaultAppID: "webclient"}, nil
+	}
+
+	enabledByID, defaultID, err := normalizeEnabledApps(opts.Apps, opts.DefaultApp)
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+
+	// Disallow data_namespace changes for existing apps.
+	for id, next := range enabledByID {
+		if cur := curApps[id]; cur != nil {
+			if strings.TrimSpace(next.DataNamespace) != strings.TrimSpace(cur.dataNamespace) {
+				s.mu.Unlock()
+				return nil, fmt.Errorf("webclient: app %q data_namespace change is not supported", id)
+			}
+		}
+	}
+
+	// Plan changes.
+	var (
+		addIDs     []string
+		removeIDs  []string
+		restartIDs []string
+		addRoots   = make(map[string]string) // app_id -> root directory
+	)
+	for id := range enabledByID {
+		if curApps[id] == nil {
+			addIDs = append(addIDs, id)
+		}
+	}
+	for id, cur := range curApps {
+		if cur == nil {
+			continue
+		}
+		if enabledByID[id] == nil {
+			removeIDs = append(removeIDs, id)
+			continue
+		}
+		if strings.TrimSpace(enabledByID[id].Platform) != strings.TrimSpace(cur.platform) {
+			restartIDs = append(restartIDs, id)
+		}
+	}
+
+	// Prepare roots for added apps; store.New happens outside the server lock.
+	base := filepath.Join(curDataDir, "webclient")
+	for _, id := range addIDs {
+		a := enabledByID[id]
+		root := filepath.Join(base, "apps", strings.TrimSpace(a.DataNamespace))
+		addRoots[id] = root
+	}
+
+	// Stage adapter restarts: swap runtime first, then stop old adapter and start new adapter.
+	type restartPlan struct {
+		id       string
+		old      *appRuntime
+		newRT    *appRuntime
+		oldAdapt *adapterClient
+	}
+	var restarts []restartPlan
+	for _, id := range restartIDs {
+		cur := curApps[id]
+		if cur == nil {
+			continue
+		}
+		next := enabledByID[id]
+		if next == nil {
+			continue
+		}
+		// New runtime reuses the same store + hubs to avoid disrupting SSE and to
+		// avoid having multiple store instances targeting the same directory.
+		newRT := &appRuntime{
+			appID:         cur.appID,
+			platform:      strings.TrimSpace(next.Platform),
+			dataNamespace: cur.dataNamespace,
+			root:          cur.root,
+			token:         cur.token,
+			publicURL:     cur.publicURL,
+			store:         cur.store,
+			events:        cur.events,
+			runEvts:       cur.runEvts,
+		}
+		if strings.TrimSpace(s.opts.ManagementBaseURL) != "" {
+			newRT.adapter = newAdapterClient(s, newRT)
+		}
+		restarts = append(restarts, restartPlan{
+			id:       id,
+			old:      cur,
+			newRT:    newRT,
+			oldAdapt: cur.adapter,
+		})
+	}
+
+	// We have an authoritative plan and haven't performed any adapter/hub side
+	// effects yet. Unlock to build any new stores (slow I/O).
+	s.mu.Unlock()
+
+	// Build new runtimes for added apps (slow I/O outside server lock).
+	addRuntimes := make(map[string]*appRuntime, len(addRoots))
+	for _, id := range addIDs {
+		root := addRoots[id]
+		a := enabledByID[id]
+		st, err := store.New(root, s.opts.PublicURL)
+		if err != nil {
+			return nil, err
+		}
+		rt := &appRuntime{
+			appID:         strings.TrimSpace(a.ID),
+			platform:      strings.TrimSpace(a.Platform),
+			dataNamespace: strings.TrimSpace(a.DataNamespace),
+			root:          root,
+			token:         strings.TrimSpace(s.opts.Token),
+			publicURL:     strings.TrimRight(strings.TrimSpace(s.opts.PublicURL), "/"),
+			store:         st,
+			events:        broker.NewHub(),
+			runEvts:       broker.NewRunHub(),
+		}
+		if strings.TrimSpace(s.opts.ManagementBaseURL) != "" {
+			rt.adapter = newAdapterClient(s, rt)
+		}
+		addRuntimes[id] = rt
+	}
+
+	// Commit swap (short critical section). No external side effects occur before this point.
+	var (
+		removedRuntimes []*appRuntime
+		oldRestarted    []*adapterClient
+		startRuntimes   []*appRuntime
+	)
+
+	s.mu.Lock()
+	// Re-check invariants under lock (Start/Stop may have run, but should not change these).
+	if strings.TrimSpace(s.opts.Host) != curHost || s.opts.Port != curPort || filepath.Clean(strings.TrimSpace(s.opts.DataDir)) != filepath.Clean(curDataDir) {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("webclient: server options changed during ApplyApps; retry")
+	}
+	if len(s.opts.Apps) == 0 {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("webclient: server is not in multi-app mode")
+	}
+
+	// Remove apps first so new requests 404 immediately.
+	for _, id := range removeIDs {
+		if cur := s.apps[id]; cur != nil {
+			delete(s.apps, id)
+			removedRuntimes = append(removedRuntimes, cur)
+		}
+	}
+
+	// Apply adapter restarts by swapping the runtime pointer.
+	for _, rp := range restarts {
+		if rp.newRT == nil {
+			continue
+		}
+		s.apps[rp.id] = rp.newRT
+		if rp.oldAdapt != nil {
+			oldRestarted = append(oldRestarted, rp.oldAdapt)
+		}
+		// Update default pointer if this app was default.
+		if s.defaultAppID == rp.id {
+			s.defaultApp = rp.newRT
+		}
+		// Start new adapter after unlock if server is started.
+		if started && rp.newRT.adapter != nil {
+			startRuntimes = append(startRuntimes, rp.newRT)
+		}
+	}
+
+	// Add new runtimes.
+	for id, rt := range addRuntimes {
+		s.apps[id] = rt
+		if started && rt != nil && rt.adapter != nil {
+			startRuntimes = append(startRuntimes, rt)
+		}
+	}
+
+	// Select and apply new default.
+	if strings.TrimSpace(defaultID) == "" {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("webclient: default_app is empty")
+	}
+	nextDefault := s.apps[defaultID]
+	if nextDefault == nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("webclient: default_app %q is not configured/enabled", defaultID)
+	}
+	s.defaultAppID = defaultID
+	s.defaultApp = nextDefault
+
+	// Persist the latest app list for subsequent ApplyApps calls.
+	s.opts.Apps = opts.Apps
+	s.opts.DefaultApp = opts.DefaultApp
+
+	// Legacy-compatible aliases point at the default app store/hubs.
+	s.root = filepath.Join(curDataDir, "webclient")
+	s.store = nextDefault.store
+	s.events = nextDefault.events
+	s.runEvts = nextDefault.runEvts
+	s.adapter = nextDefault.adapter
+
+	// Refresh started flag snapshot.
+	started = s.started
+	s.mu.Unlock()
+
+	// Side effects happen after the swap so errors cannot leave us in a partially
+	// applied state. Stop can block, so we do it after the map mutation so new
+	// requests observe 404 immediately.
+	for _, rt := range removedRuntimes {
+		if rt == nil {
+			continue
+		}
+		if rt.adapter != nil {
+			rt.adapter.Stop()
+		}
+		rt.events.Close()
+		rt.runEvts.Close()
+	}
+
+	for _, a := range oldRestarted {
+		if a != nil {
+			a.Stop()
+		}
+	}
+
+	// Start adapters for added + restarted apps when server is started.
+	if started {
+		for _, rt := range startRuntimes {
+			if rt == nil || rt.adapter == nil {
+				continue
+			}
+			rt.adapter.Start()
+			go func(rtt *appRuntime) {
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				_ = rtt.adapter.WaitReady(ctx)
+				if n, err := rtt.recoverOutboxOnce(ctx, 50); err != nil {
+					slog.Warn("webclient: outbox recovery failed", "app", rtt.appID, "error", err)
+				} else if n > 0 {
+					slog.Info("webclient: outbox recovery attempted", "app", rtt.appID, "count", n)
+				}
+			}(rt)
+		}
+	}
+
+	return &ApplyAppsResult{
+		Added:            addIDs,
+		Removed:          removeIDs,
+		AdapterRestarted: restartIDs,
+		DefaultAppID:     defaultID,
+	}, nil
+}
+
 func (s *Server) Platform(project string) core.Platform {
 	return newPlatform(s, project)
 }
 
 func (s *Server) UsesExternalAdapter() bool {
-	return s != nil && s.defaultApp != nil && s.defaultApp.adapter != nil
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.defaultApp != nil && s.defaultApp.adapter != nil
 }
 
 func (s *Server) Start() error {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+
 	s.mu.Lock()
 	if s.started {
 		s.mu.Unlock()
@@ -184,6 +523,10 @@ func (s *Server) Start() error {
 	s.httpServer = srv
 	s.listener = ln
 	s.started = true
+	runtimes := make([]*appRuntime, 0, len(s.apps))
+	for _, rt := range s.apps {
+		runtimes = append(runtimes, rt)
+	}
 	s.mu.Unlock()
 
 	go func() {
@@ -195,7 +538,7 @@ func (s *Server) Start() error {
 	}()
 
 	// Start external adapters per app (if configured).
-	for _, rt := range s.apps {
+	for _, rt := range runtimes {
 		if rt.adapter == nil {
 			continue
 		}
@@ -221,13 +564,17 @@ func (s *Server) Start() error {
 // recoverOutboxOnce scans due outbox items for the default app and attempts delivery.
 // Tests may call this directly; Start also invokes it once for each app.
 func (s *Server) recoverOutboxOnce(ctx context.Context, limit int) (int, error) {
-	if s.defaultApp == nil {
+	rt := s.defaultRuntime()
+	if rt == nil {
 		return 0, fmt.Errorf("webclient: default app is not initialized")
 	}
-	return s.defaultApp.recoverOutboxOnce(ctx, limit)
+	return rt.recoverOutboxOnce(ctx, limit)
 }
 
 func (s *Server) Stop(ctx context.Context) error {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+
 	s.mu.Lock()
 	if !s.started {
 		s.mu.Unlock()
@@ -238,14 +585,18 @@ func (s *Server) Stop(ctx context.Context) error {
 	s.httpServer = nil
 	ln := s.listener
 	s.listener = nil
+	runtimes := make([]*appRuntime, 0, len(s.apps))
+	for _, rt := range s.apps {
+		runtimes = append(runtimes, rt)
+	}
 	s.mu.Unlock()
 
-	for _, rt := range s.apps {
-		rt.events.Close()
-		rt.runEvts.Close()
+	for _, rt := range runtimes {
 		if rt.adapter != nil {
 			rt.adapter.Stop()
 		}
+		rt.events.Close()
+		rt.runEvts.Close()
 	}
 	if ln != nil {
 		_ = ln.Close()
@@ -1222,7 +1573,10 @@ func (s *Server) initApps() error {
 }
 
 func (s *Server) defaultRuntime() *appRuntime {
-	return s.defaultApp
+	s.mu.RLock()
+	rt := s.defaultApp
+	s.mu.RUnlock()
+	return rt
 }
 
 func (s *Server) appRuntimeByID(appID string) (*appRuntime, bool) {
@@ -1230,8 +1584,92 @@ func (s *Server) appRuntimeByID(appID string) (*appRuntime, bool) {
 	if appID == "" {
 		return nil, false
 	}
+	s.mu.RLock()
 	rt, ok := s.apps[appID]
+	s.mu.RUnlock()
 	return rt, ok
+}
+
+type normalizedApp struct {
+	ID            string
+	Platform      string
+	DataNamespace string
+}
+
+func normalizeEnabledApps(apps []AppOptions, defaultApp string) (map[string]*normalizedApp, string, error) {
+	reNS := regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	seenID := make(map[string]bool)
+	seenPlatform := make(map[string]bool)
+	seenNS := make(map[string]bool)
+
+	enabled := make(map[string]*normalizedApp)
+	var enabledOrder []string
+	var defaultFlagged string
+
+	for i := range apps {
+		a := apps[i]
+		enabledFlag := true
+		if a.Enabled != nil {
+			enabledFlag = *a.Enabled
+		}
+		id := strings.TrimSpace(a.ID)
+		platform := strings.TrimSpace(a.Platform)
+		ns := strings.TrimSpace(a.DataNamespace)
+		if !enabledFlag {
+			if a.Default {
+				if id == "" {
+					return nil, "", fmt.Errorf("webclient: disabled app cannot be default")
+				}
+				return nil, "", fmt.Errorf("webclient: app %q cannot be default when disabled", id)
+			}
+			continue
+		}
+		if id == "" || platform == "" || ns == "" {
+			return nil, "", fmt.Errorf("webclient: app requires id/platform/data_namespace")
+		}
+		if !reNS.MatchString(id) {
+			return nil, "", fmt.Errorf("webclient: invalid app id %q", id)
+		}
+		if !reNS.MatchString(platform) {
+			return nil, "", fmt.Errorf("webclient: invalid app platform %q", platform)
+		}
+		if !reNS.MatchString(ns) {
+			return nil, "", fmt.Errorf("webclient: invalid data_namespace %q", ns)
+		}
+		if seenID[id] {
+			return nil, "", fmt.Errorf("webclient: duplicate app id %q", id)
+		}
+		seenID[id] = true
+		if seenPlatform[platform] {
+			return nil, "", fmt.Errorf("webclient: duplicate app platform %q", platform)
+		}
+		seenPlatform[platform] = true
+		if seenNS[ns] {
+			return nil, "", fmt.Errorf("webclient: duplicate app data_namespace %q", ns)
+		}
+		seenNS[ns] = true
+
+		enabled[id] = &normalizedApp{ID: id, Platform: platform, DataNamespace: ns}
+		enabledOrder = append(enabledOrder, id)
+		if a.Default {
+			defaultFlagged = id
+		}
+	}
+	if len(enabled) == 0 {
+		return nil, "", fmt.Errorf("webclient: no enabled apps configured")
+	}
+
+	defaultID := strings.TrimSpace(defaultApp)
+	if defaultID == "" {
+		defaultID = strings.TrimSpace(defaultFlagged)
+	}
+	if defaultID == "" {
+		defaultID = enabledOrder[0]
+	}
+	if enabled[defaultID] == nil {
+		return nil, "", fmt.Errorf("webclient: default_app %q is not configured/enabled", defaultID)
+	}
+	return enabled, defaultID, nil
 }
 
 func (rt *appRuntime) attachmentURLLegacy(id string) string {

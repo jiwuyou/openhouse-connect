@@ -42,6 +42,10 @@ type providerWiringResult struct {
 	canStartInitialRefresh    bool
 }
 
+type webClientAppsApplier interface {
+	ApplyApps(opts webclient.Options) (*webclient.ApplyAppsResult, error)
+}
+
 type projectRuntime struct {
 	project          config.ProjectConfig
 	engine           *core.Engine
@@ -882,13 +886,18 @@ func setupLogger(level string, w io.Writer) {
 }
 
 // reloadConfig re-reads config.toml and applies hot-reloadable settings
-// (display, providers, commands) to the given engine.
-func reloadConfig(configPath, projName string, engine *core.Engine) (*core.ConfigReloadResult, error) {
+// (display, providers, commands) to the given engine. If a running webclient
+// server is provided, it will also attempt to hot-apply webclient multi-app
+// config (when supported by the server implementation).
+func reloadConfig(configPath, projName string, engine *core.Engine, webclientSrv webClientAppsApplier) (*core.ConfigReloadResult, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("reload config: %w", err)
 	}
+	return reloadConfigFrom(cfg, projName, engine, webclientSrv)
+}
 
+func reloadConfigFrom(cfg *config.Config, projName string, engine *core.Engine, webclientSrv webClientAppsApplier) (*core.ConfigReloadResult, error) {
 	result := &core.ConfigReloadResult{}
 
 	// Find the matching project
@@ -996,8 +1005,49 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 		engine.SetUserRoles(nil)
 	}
 
+	// Hot-apply webclient apps (idempotent; management reload calls this per-project).
+	if err := applyWebClientHotReloadFromConfig(cfg, webclientSrv); err != nil {
+		return nil, err
+	}
+
 	slog.Info("config reloaded", "project", projName)
 	return result, nil
+}
+
+func applyWebClientHotReloadFromConfig(cfg *config.Config, webclientSrv webClientAppsApplier) error {
+	if webclientSrv == nil {
+		return nil
+	}
+	if cfg.WebClient.Enabled == nil || !*cfg.WebClient.Enabled {
+		// Not hot-switching webclient on/off here. If it's running, it keeps its
+		// previous config until restart.
+		return nil
+	}
+
+	managementBaseURL := ""
+	managementToken := ""
+	if cfg.Management.Enabled != nil && *cfg.Management.Enabled {
+		managementPort := cfg.Management.Port
+		if managementPort <= 0 {
+			managementPort = 9820
+		}
+		managementBaseURL = "http://" + net.JoinHostPort(localLoopbackHost(cfg.Management.Host), strconv.Itoa(managementPort))
+		managementToken = cfg.Management.Token
+	}
+
+	opts := buildWebClientOptions(cfg, managementBaseURL, managementToken)
+	if err := applyWebClientAppsHotReloadIfSupported(webclientSrv, opts); err != nil {
+		return fmt.Errorf("webclient: apply apps: %w", err)
+	}
+	return nil
+}
+
+func applyWebClientAppsHotReloadIfSupported(webclientSrv webClientAppsApplier, opts webclient.Options) error {
+	if webclientSrv == nil {
+		return nil
+	}
+	_, err := webclientSrv.ApplyApps(opts)
+	return err
 }
 
 func buildProjectRuntime(cfg *config.Config, proj config.ProjectConfig, configPath string, observeEnabled bool, observeChannel string, webclientSrv *webclient.Server) (*projectRuntime, error) {
@@ -1391,8 +1441,12 @@ func buildProjectRuntime(cfg *config.Config, proj config.ProjectConfig, configPa
 
 	capturedEngine := engine
 	capturedProjName := projName
+	var capturedWebClientSrv webClientAppsApplier
+	if webclientSrv != nil {
+		capturedWebClientSrv = webclientSrv
+	}
 	engine.SetConfigReloadFunc(func() (*core.ConfigReloadResult, error) {
-		return reloadConfig(configPath, capturedProjName, capturedEngine)
+		return reloadConfig(configPath, capturedProjName, capturedEngine, capturedWebClientSrv)
 	})
 	engine.SetWebSetupFunc(func() (int, string, bool, error) {
 		mgmtToken := core.GenerateToken(16)

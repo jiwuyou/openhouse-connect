@@ -64,15 +64,19 @@ func (p *platform) Send(ctx context.Context, replyCtx any, content string) error
 	if content == "" {
 		return nil
 	}
+	rt := p.s.defaultRuntime()
+	if rt == nil || rt.store == nil {
+		return fmt.Errorf("webclient: default app is not configured")
+	}
 	msg := store.Message{
 		Role:    store.RoleAssistant,
 		Content: content,
 	}
-	stored, err := p.s.store.AppendMessage(rc.Project, rc.Session, msg)
+	stored, err := rt.store.AppendMessage(rc.Project, rc.Session, msg)
 	if err != nil {
 		return err
 	}
-	p.s.events.Publish(rc.Project, rc.Session, stored)
+	rt.events.Publish(rc.Project, rc.Session, stored)
 	return nil
 }
 
@@ -81,7 +85,11 @@ func (p *platform) SendImage(ctx context.Context, replyCtx any, img core.ImageAt
 	if err != nil {
 		return err
 	}
-	meta, att, err := p.s.storeSaveImage(img)
+	rt := p.s.defaultRuntime()
+	if rt == nil || rt.store == nil {
+		return fmt.Errorf("webclient: default app is not configured")
+	}
+	meta, att, err := rt.storeSaveImage(img)
 	if err != nil {
 		return err
 	}
@@ -98,11 +106,11 @@ func (p *platform) SendImage(ctx context.Context, replyCtx any, img core.ImageAt
 			},
 		},
 	}
-	stored, err := p.s.store.AppendMessage(rc.Project, rc.Session, msg)
+	stored, err := rt.store.AppendMessage(rc.Project, rc.Session, msg)
 	if err != nil {
 		return err
 	}
-	p.s.events.Publish(rc.Project, rc.Session, stored)
+	rt.events.Publish(rc.Project, rc.Session, stored)
 	return nil
 }
 
@@ -111,7 +119,11 @@ func (p *platform) SendFile(ctx context.Context, replyCtx any, file core.FileAtt
 	if err != nil {
 		return err
 	}
-	meta, att, err := p.s.storeSaveFile(file)
+	rt := p.s.defaultRuntime()
+	if rt == nil || rt.store == nil {
+		return fmt.Errorf("webclient: default app is not configured")
+	}
+	meta, att, err := rt.storeSaveFile(file)
 	if err != nil {
 		return err
 	}
@@ -128,11 +140,11 @@ func (p *platform) SendFile(ctx context.Context, replyCtx any, file core.FileAtt
 			},
 		},
 	}
-	stored, err := p.s.store.AppendMessage(rc.Project, rc.Session, msg)
+	stored, err := rt.store.AppendMessage(rc.Project, rc.Session, msg)
 	if err != nil {
 		return err
 	}
-	p.s.events.Publish(rc.Project, rc.Session, stored)
+	rt.events.Publish(rc.Project, rc.Session, stored)
 	return nil
 }
 

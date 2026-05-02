@@ -426,7 +426,14 @@ func (s *Server) handleBridgeWS(w http.ResponseWriter, r *http.Request) {
 
 		// Persist first; never forward user messages upstream if persistence
 		// fails.
-		obProject, obID, err := s.bridgePersistOutbound(sess.state, raw)
+		rt := s.defaultRuntime()
+		if rt == nil || rt.store == nil {
+			slog.Warn("webclient: bridge outbound persist failed (default app not configured)")
+			_ = downConn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "persist failed"), time.Now().Add(2*time.Second))
+			_ = downConn.Close()
+			return
+		}
+		obProject, obID, err := s.bridgePersistOutboundForRuntime(rt, sess.state, raw)
 		if err != nil {
 			slog.Warn("webclient: bridge outbound persist failed", "error", err)
 			_ = downConn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "persist failed"), time.Now().Add(2*time.Second))
@@ -435,7 +442,7 @@ func (s *Server) handleBridgeWS(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := sess.writeUpstream(mt, raw); err != nil {
 			if obID != "" {
-				_, _ = s.store.MarkOutboxFailed(obProject, obID, err.Error(), time.Now().UTC())
+				_, _ = rt.store.MarkOutboxFailed(obProject, obID, err.Error(), time.Now().UTC())
 			}
 			slog.Warn("webclient: bridge upstream write failed", "error", err)
 			_ = downConn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "upstream write failed"), time.Now().Add(2*time.Second))
@@ -443,7 +450,7 @@ func (s *Server) handleBridgeWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if obID != "" {
-			if _, err := s.store.MarkOutboxSent(obProject, obID); err != nil {
+			if _, err := rt.store.MarkOutboxSent(obProject, obID); err != nil {
 				slog.Warn("webclient: bridge outbox mark sent failed", "error", err)
 			}
 		}
@@ -522,7 +529,12 @@ func (sess *bridgeUpstreamSession) upstreamReadLoop() {
 
 		// Persist first; never forward inbound frames to browsers if persistence
 		// fails.
-		if err := sess.srv.bridgePersistInbound(sess.state, raw); err != nil {
+		rt := sess.srv.defaultRuntime()
+		if rt == nil || rt.store == nil {
+			slog.Warn("webclient: bridge inbound persist failed (default app not configured)")
+			return
+		}
+		if err := sess.srv.bridgePersistInboundForRuntime(rt, sess.state, raw); err != nil {
 			slog.Warn("webclient: bridge inbound persist failed", "error", err)
 			return
 		}
@@ -587,7 +599,10 @@ type bridgeReply struct {
 	RefID         string `json:"ref_id,omitempty"`
 }
 
-func (s *Server) bridgePersistOutbound(state *bridgeProxyState, raw []byte) (outboxProject string, outboxID string, _ error) {
+func (s *Server) bridgePersistOutboundForRuntime(rt *appRuntime, state *bridgeProxyState, raw []byte) (outboxProject string, outboxID string, _ error) {
+	if rt == nil || rt.store == nil {
+		return "", "", fmt.Errorf("webclient: default app is not configured")
+	}
 	var base bridgeBase
 	if err := json.Unmarshal(raw, &base); err != nil {
 		return "", "", nil
@@ -613,7 +628,7 @@ func (s *Server) bridgePersistOutbound(state *bridgeProxyState, raw []byte) (out
 		if project == "" {
 			return "", "", nil
 		}
-		obID, err := s.persistBridgeUserMessage(project, m, true)
+		obID, err := s.persistBridgeUserMessageForRuntime(rt, project, m, true)
 		if err != nil {
 			return "", "", err
 		}
@@ -640,13 +655,16 @@ func (s *Server) bridgePersistOutbound(state *bridgeProxyState, raw []byte) (out
 		m.Content = "[card_action] " + strings.TrimSpace(m.Action)
 		m.Images = nil
 		m.Files = nil
-		_, err := s.persistBridgeUserMessage(project, m, false)
+		_, err := s.persistBridgeUserMessageForRuntime(rt, project, m, false)
 		return "", "", err
 	}
 	return "", "", nil
 }
 
-func (s *Server) bridgePersistInbound(state *bridgeProxyState, raw []byte) error {
+func (s *Server) bridgePersistInboundForRuntime(rt *appRuntime, state *bridgeProxyState, raw []byte) error {
+	if rt == nil || rt.store == nil {
+		return fmt.Errorf("webclient: default app is not configured")
+	}
 	var base bridgeBase
 	if err := json.Unmarshal(raw, &base); err != nil {
 		return nil
@@ -661,7 +679,7 @@ func (s *Server) bridgePersistInbound(state *bridgeProxyState, raw []byte) error
 		if project == "" {
 			return nil
 		}
-		return s.persistBridgeAssistantEvent(project, base.Type, r, raw)
+		return s.persistBridgeAssistantEventForRuntime(rt, project, base.Type, r, raw)
 	case "error":
 		var ev struct {
 			SessionKey string `json:"session_key"`
@@ -680,7 +698,7 @@ func (s *Server) bridgePersistInbound(state *bridgeProxyState, raw []byte) error
 		if sessionKey == "" {
 			return nil
 		}
-		sessionID, err := s.ensureClientSessionForBridge(project, sessionKey, strings.TrimSpace(ev.SessionID))
+		sessionID, err := s.ensureClientSessionForBridgeForRuntime(rt, project, sessionKey, strings.TrimSpace(ev.SessionID))
 		if err != nil {
 			return err
 		}
@@ -695,14 +713,14 @@ func (s *Server) bridgePersistInbound(state *bridgeProxyState, raw []byte) error
 		} else {
 			msg = "[error]"
 		}
-		run, ok := s.bestEffortLastUserRun(project, sessionID)
+		run, ok := bestEffortLastUserRunForRuntime(rt, project, sessionID)
 		runID := strings.TrimSpace(run.RunID)
 		userMsgID := strings.TrimSpace(run.UserMessageID)
 		if !ok {
 			runID = ""
 			userMsgID = ""
 		}
-		_, err = s.store.AppendMessage(project, sessionID, store.Message{
+		_, err = rt.store.AppendMessage(project, sessionID, store.Message{
 			Role:          store.RoleAssistant,
 			Content:       msg,
 			RunID:         runID,
@@ -725,7 +743,40 @@ func stableJSON(raw []byte) string {
 	return string(b)
 }
 
-func (s *Server) persistBridgeUserMessage(project string, m bridgeMessage, createOutbox bool) (string, error) {
+func bestEffortLastUserRunForRuntime(rt *appRuntime, project, sessionID string) (runRef, bool) {
+	if rt == nil || rt.store == nil {
+		return runRef{}, false
+	}
+	msgs, err := rt.store.ReadMessages(project, sessionID)
+	if err != nil || len(msgs) == 0 {
+		return runRef{}, false
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := msgs[i]
+		if strings.TrimSpace(m.Role) != store.RoleUser {
+			continue
+		}
+		id := strings.TrimSpace(m.ID)
+		if id == "" {
+			continue
+		}
+		runID := strings.TrimSpace(m.RunID)
+		if runID == "" {
+			runID = id
+		}
+		userID := strings.TrimSpace(m.UserMessageID)
+		if userID == "" {
+			userID = id
+		}
+		return runRef{RunID: runID, UserMessageID: userID, UpdatedAt: m.Timestamp}, true
+	}
+	return runRef{}, false
+}
+
+func (s *Server) persistBridgeUserMessageForRuntime(rt *appRuntime, project string, m bridgeMessage, createOutbox bool) (string, error) {
+	if rt == nil || rt.store == nil {
+		return "", fmt.Errorf("webclient: default app is not configured")
+	}
 	if err := store.ValidateSegment("project", project); err != nil {
 		return "", err
 	}
@@ -733,7 +784,7 @@ func (s *Server) persistBridgeUserMessage(project string, m bridgeMessage, creat
 	if sessionKey == "" {
 		return "", fmt.Errorf("session_key is required")
 	}
-	sessionID, err := s.ensureClientSessionForBridge(project, sessionKey, strings.TrimSpace(m.SessionID))
+	sessionID, err := s.ensureClientSessionForBridgeForRuntime(rt, project, sessionKey, strings.TrimSpace(m.SessionID))
 	if err != nil {
 		return "", err
 	}
@@ -744,7 +795,7 @@ func (s *Server) persistBridgeUserMessage(project string, m bridgeMessage, creat
 		if err != nil {
 			return "", fmt.Errorf("invalid image base64")
 		}
-		_, att, err := s.storeSaveImage(core.ImageAttachment{
+		_, att, err := rt.storeSaveImage(core.ImageAttachment{
 			MimeType: strings.TrimSpace(img.MimeType),
 			Data:     b,
 			FileName: strings.TrimSpace(img.FileName),
@@ -759,7 +810,7 @@ func (s *Server) persistBridgeUserMessage(project string, m bridgeMessage, creat
 		if err != nil {
 			return "", fmt.Errorf("invalid file base64")
 		}
-		_, att, err := s.storeSaveFile(core.FileAttachment{
+		_, att, err := rt.storeSaveFile(core.FileAttachment{
 			MimeType: strings.TrimSpace(f.MimeType),
 			Data:     b,
 			FileName: strings.TrimSpace(f.FileName),
@@ -771,7 +822,7 @@ func (s *Server) persistBridgeUserMessage(project string, m bridgeMessage, creat
 	}
 
 	content := strings.TrimSpace(m.Content)
-	_, err = s.store.AppendMessage(project, sessionID, store.Message{
+	_, err = rt.store.AppendMessage(project, sessionID, store.Message{
 		Role:        store.RoleUser,
 		Content:     content,
 		Attachments: atts,
@@ -797,7 +848,7 @@ func (s *Server) persistBridgeUserMessage(project string, m bridgeMessage, creat
 	if strings.TrimSpace(m.MsgID) != "" {
 		obID = strings.TrimSpace(m.MsgID)
 	}
-	ob, err := s.store.CreateOutboxItem(store.CreateOutboxItemInput{
+	ob, err := rt.store.CreateOutboxItem(store.CreateOutboxItemInput{
 		ID:          obID,
 		Project:     project,
 		SessionID:   sessionID,
@@ -817,7 +868,10 @@ func (s *Server) persistBridgeUserMessage(project string, m bridgeMessage, creat
 	return ob.ID, nil
 }
 
-func (s *Server) persistBridgeAssistantEvent(project, typ string, r bridgeReply, raw []byte) error {
+func (s *Server) persistBridgeAssistantEventForRuntime(rt *appRuntime, project, typ string, r bridgeReply, raw []byte) error {
+	if rt == nil || rt.store == nil {
+		return fmt.Errorf("webclient: default app is not configured")
+	}
 	if err := store.ValidateSegment("project", project); err != nil {
 		return err
 	}
@@ -825,12 +879,12 @@ func (s *Server) persistBridgeAssistantEvent(project, typ string, r bridgeReply,
 	if sessionKey == "" {
 		return nil
 	}
-	sessionID, err := s.ensureClientSessionForBridge(project, sessionKey, strings.TrimSpace(r.SessionID))
+	sessionID, err := s.ensureClientSessionForBridgeForRuntime(rt, project, sessionKey, strings.TrimSpace(r.SessionID))
 	if err != nil {
 		return err
 	}
 
-	atts, err := s.persistBridgeReplyAttachments(typ, r, raw)
+	atts, err := s.persistBridgeReplyAttachmentsForRuntime(rt, typ, r, raw)
 	if err != nil {
 		return err
 	}
@@ -841,7 +895,7 @@ func (s *Server) persistBridgeAssistantEvent(project, typ string, r bridgeReply,
 	// as "run trace" tied to a user message.
 	switch typ {
 	case "reply_stream", "preview_start", "update_message", "delete_message":
-		run, ok := s.bestEffortLastUserRun(project, sessionID)
+		run, ok := bestEffortLastUserRunForRuntime(rt, project, sessionID)
 		runID := strings.TrimSpace(run.RunID)
 		userMsgID := strings.TrimSpace(run.UserMessageID)
 		metadata := map[string]any{}
@@ -885,7 +939,7 @@ func (s *Server) persistBridgeAssistantEvent(project, typ string, r bridgeReply,
 			runID = ""
 			userMsgID = ""
 		}
-		storedEv, err := s.store.AppendRunEvent(project, sessionID, store.RunEvent{
+		storedEv, err := rt.store.AppendRunEvent(project, sessionID, store.RunEvent{
 			RunID:         runID,
 			UserMessageID: userMsgID,
 			SessionID:     sessionID,
@@ -897,7 +951,7 @@ func (s *Server) persistBridgeAssistantEvent(project, typ string, r bridgeReply,
 			Metadata:      metadata,
 		})
 		if err == nil {
-			s.runEvts.Publish(project, sessionID, storedEv)
+			rt.runEvts.Publish(project, sessionID, storedEv)
 		}
 		return err
 	}
@@ -931,20 +985,12 @@ func (s *Server) persistBridgeAssistantEvent(project, typ string, r bridgeReply,
 			content = "[image] " + stableJSON(raw)
 		}
 	}
-	_, err = s.store.AppendMessage(project, sessionID, store.Message{
+	_, err = rt.store.AppendMessage(project, sessionID, store.Message{
 		Role:        store.RoleAssistant,
 		Content:     content,
 		Attachments: atts,
 	})
 	return err
-}
-
-func (s *Server) persistBridgeReplyAttachments(typ string, r bridgeReply, rawJSON []byte) ([]store.Attachment, error) {
-	rt := s.defaultRuntime()
-	if rt == nil {
-		return nil, fmt.Errorf("webclient: default app is not configured")
-	}
-	return s.persistBridgeReplyAttachmentsForRuntime(rt, typ, r, rawJSON)
 }
 
 func (s *Server) persistBridgeReplyAttachmentsForRuntime(rt *appRuntime, typ string, r bridgeReply, rawJSON []byte) ([]store.Attachment, error) {
@@ -1029,10 +1075,13 @@ func (s *Server) persistBridgeReplyAttachmentsForRuntime(rt *appRuntime, typ str
 	return out, nil
 }
 
-func (s *Server) ensureClientSessionForBridge(project, sessionKey, sessionID string) (string, error) {
+func (s *Server) ensureClientSessionForBridgeForRuntime(rt *appRuntime, project, sessionKey, sessionID string) (string, error) {
+	if rt == nil || rt.store == nil {
+		return "", fmt.Errorf("webclient: default app is not configured")
+	}
 	if strings.TrimSpace(sessionID) != "" {
 		// Ensure meta exists; tolerate "already exists".
-		_, _ = s.store.CreateClientSession(project, store.CreateClientSessionInput{
+		_, _ = rt.store.CreateClientSession(project, store.CreateClientSessionInput{
 			ID:         sessionID,
 			SessionKey: sessionKey,
 			Name:       sessionID,
@@ -1040,13 +1089,13 @@ func (s *Server) ensureClientSessionForBridge(project, sessionKey, sessionID str
 		return sessionID, nil
 	}
 
-	id, err := s.store.ActiveSessionID(project, sessionKey)
+	id, err := rt.store.ActiveSessionID(project, sessionKey)
 	if err == nil && strings.TrimSpace(id) != "" {
 		return id, nil
 	}
 
 	newID := "web_" + uuid.NewString()
-	created, err := s.store.CreateClientSession(project, store.CreateClientSessionInput{
+	created, err := rt.store.CreateClientSession(project, store.CreateClientSessionInput{
 		ID:         newID,
 		SessionKey: sessionKey,
 		Name:       newID,
@@ -1055,7 +1104,7 @@ func (s *Server) ensureClientSessionForBridge(project, sessionKey, sessionID str
 		return created.ID, nil
 	}
 	// Best-effort: even if create failed due to a race, try to resolve again.
-	if id2, err2 := s.store.ActiveSessionID(project, sessionKey); err2 == nil && strings.TrimSpace(id2) != "" {
+	if id2, err2 := rt.store.ActiveSessionID(project, sessionKey); err2 == nil && strings.TrimSpace(id2) != "" {
 		return id2, nil
 	}
 	return "", fmt.Errorf("failed to resolve session id for session_key")
