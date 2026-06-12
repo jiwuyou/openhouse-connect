@@ -10,10 +10,18 @@ warn() { printf '%s\n' "$*" >&2; }
 svc_name="cc-connect"
 svc_desc="OpenHouse Connect (cc-connect): agent bridge + webclient"
 
-# Current ports (see /root/projects/openhouse/docs/ports.md).
-bridge_port=${CC_CONNECT_BRIDGE_PORT:-9810}
-management_port=${CC_CONNECT_MANAGEMENT_PORT:-9820}
-webclient_port=${CC_CONNECT_WEBCLIENT_PORT:-9840}
+# OpenHouse SmallPhoneAI ports.
+bridge_port=${CC_CONNECT_BRIDGE_PORT:-21010}
+management_port=${CC_CONNECT_MANAGEMENT_PORT:-21020}
+webclient_port=${CC_CONNECT_WEBCLIENT_PORT:-21040}
+bridge_token=${CC_CONNECT_BRIDGE_TOKEN:-smallphoneai-bridge-token}
+management_token=${CC_CONNECT_MANAGEMENT_TOKEN:-smallphoneai-management-token}
+webclient_token=${CC_CONNECT_WEBCLIENT_TOKEN:-smallphoneai-webclient-token}
+smallphone_work_dir=${CC_CONNECT_SMALLPHONE_WORK_DIR:-/root/smallphoneai-repos/smallphone-active}
+smallphone_agent_type=${CC_CONNECT_SMALLPHONE_AGENT_TYPE:-claudecode}
+smallphone_agent_mode=${CC_CONNECT_SMALLPHONE_AGENT_MODE:-default}
+smallphone_claude_cli=${CC_CONNECT_SMALLPHONE_CLAUDE_CLI:-/root/.npm-global/bin/claude}
+service_path="/root/.npm-global/bin:/root/.local/node/bin:/root/.opencode/bin:/root/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin:/system/bin:/system/xbin:/data/data/com.termux/files/usr/bin"
 
 tag_group="group:local-stack"
 tag_component="openhouse-component:cc-connect"
@@ -45,8 +53,70 @@ if [ -z "${bin_path}" ]; then
   exit 0
 fi
 
+cfg_path="${CC_CONNECT_CONFIG_PATH:-${repo_root}/config.smallphoneai.toml}"
+
+ensure_smallphoneai_config() {
+  if [ -f "${cfg_path}" ]; then
+    if grep -Fq '[[projects]]' "${cfg_path}" \
+      && grep -Fq 'type = "claudecode"' "${cfg_path}" \
+      && grep -Fq 'cli_path = "' "${cfg_path}" \
+      && ! grep -Fq '${CC_CONNECT_' "${cfg_path}"; then
+      return 0
+    fi
+    warn "note: refreshing stale SmallPhoneAI cc-connect config: ${cfg_path}"
+  fi
+
+  mkdir -p "$(dirname "${cfg_path}")"
+  cat >"${cfg_path}" <<EOF
+[log]
+level = "info"
+
+[bridge]
+enabled = true
+host = "127.0.0.1"
+port = ${bridge_port}
+token = "${bridge_token}"
+path = "/bridge/ws"
+cors_origins = ["*"]
+
+[management]
+enabled = true
+host = "127.0.0.1"
+port = ${management_port}
+token = "${management_token}"
+cors_origins = ["http://127.0.0.1:${webclient_port}", "http://localhost:${webclient_port}"]
+
+[webclient]
+enabled = true
+host = "127.0.0.1"
+port = ${webclient_port}
+token = "${webclient_token}"
+public_url = "http://127.0.0.1:${webclient_port}"
+default_app = "smallphone"
+
+[[webclient.apps]]
+id = "smallphone"
+platform = "webclient-smallphone"
+data_namespace = "smallphone"
+enabled = true
+
+[[projects]]
+name = "smallphone"
+display_name = "SmallPhone"
+
+[projects.agent]
+type = "${smallphone_agent_type}"
+
+[projects.agent.options]
+work_dir = "${smallphone_work_dir}"
+cli_path = "${smallphone_claude_cli}"
+mode = "${smallphone_agent_mode}"
+EOF
+}
+
+ensure_smallphoneai_config
+
 cfg_arg=""
-cfg_path="${CC_CONNECT_CONFIG_PATH:-}"
 if [ -n "${cfg_path}" ]; then
   cfg_arg="--config ${cfg_path}"
 fi
@@ -60,12 +130,12 @@ else
 fi
 
 # service-manager registration (optional; guarded).
-sm_url="${SERVICE_MANAGER_URL:-http://127.0.0.1:8787}"
+sm_url="${SERVICE_MANAGER_URL:-http://127.0.0.1:20087}"
 
 if ! command -v service-manager >/dev/null 2>&1; then
   warn
   warn "note: service-manager CLI not found on PATH; skipping registration."
-  warn "  expected: service-manager serve --bind 127.0.0.1:8787"
+  warn "  expected: service-manager serve --bind 127.0.0.1:20087"
   exit 0
 fi
 
@@ -78,7 +148,7 @@ fi
 if ! curl -fsS --max-time 2 "${sm_url}/api/v1/health" >/dev/null 2>&1; then
   warn
   warn "note: service-manager does not appear reachable at: ${sm_url}"
-  warn "  start it with: service-manager serve --bind 127.0.0.1:8787"
+  warn "  start it with: service-manager serve --bind 127.0.0.1:20087"
   warn "  or set SERVICE_MANAGER_URL=http://host:port"
   exit 0
 fi
@@ -140,7 +210,7 @@ fi
 
 ${py} - "${svc_name}" "${svc_desc}" "${bin_path}" "${repo_root}" "${cfg_path}" \
   "${bridge_port}" "${management_port}" "${webclient_port}" \
-  "${tag_group}" "${tag_component}" >"${spec_file}" <<'PY'
+  "${tag_group}" "${tag_component}" "${service_path}" >"${spec_file}" <<'PY'
 import json
 import sys
 
@@ -155,6 +225,7 @@ import sys
     webclient_port,
     tag_group,
     tag_component,
+    service_path,
 ) = sys.argv[1:]
 
 cmd = [bin_path]
@@ -175,7 +246,7 @@ spec = {
     "provider": "process",
     "command": cmd,
     "working_dir": repo_root,
-    "env": {},
+    "env": {"PATH": service_path},
     "runtime": {},
     "restart": {"mode": "always", "max_retries": 0},
     "health": [tcp_check(bridge_port), tcp_check(mgmt_port), tcp_check(webclient_port)],
